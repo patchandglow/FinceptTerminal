@@ -1,0 +1,274 @@
+#include "screens/info/PrivacyScreen.h"
+
+#include "core/events/EventBus.h"
+#include "ui/theme/Theme.h"
+
+#include <QEvent>
+#include <QGridLayout>
+#include <QHBoxLayout>
+#include <QLabel>
+#include <QMetaMethod>
+#include <QPushButton>
+#include <QScrollArea>
+#include <QShowEvent>
+#include <QVBoxLayout>
+
+namespace fincept::screens {
+
+using namespace fincept::ui;
+
+static const char* MF = "font-family:'Consolas','Courier New',monospace;";
+
+static QLabel* section_heading(const QString& icon, const QString& title) {
+    auto* lbl = new QLabel(QString("%1  %2").arg(icon, title));
+    lbl->setStyleSheet(QString("color: %1; font-size: 14px; font-weight: 700; "
+                               "background: transparent; margin-top: 8px; %2")
+                           .arg(colors::AMBER(), MF));
+    return lbl;
+}
+
+static QLabel* body_text(const QString& text) {
+    auto* lbl = new QLabel(text);
+    lbl->setWordWrap(true);
+    lbl->setStyleSheet(
+        QString("color: %1; font-size: 12px; background: transparent; %2").arg(colors::TEXT_PRIMARY(), MF));
+    return lbl;
+}
+
+static QLabel* bullet(const QString& text) {
+    auto* lbl = new QLabel(QString("  > %1").arg(text));
+    lbl->setWordWrap(true);
+    lbl->setStyleSheet(
+        QString("color: %1; font-size: 12px; background: transparent; %2").arg(colors::TEXT_SECONDARY(), MF));
+    return lbl;
+}
+
+static QWidget* info_card(const QString& title, const QString& desc) {
+    auto* card = new QWidget(nullptr);
+    card->setStyleSheet(QString("background: %1; border: 1px solid %2; border-radius: 2px;")
+                            .arg(colors::BG_SURFACE(), colors::BORDER_DIM()));
+    auto* vl = new QVBoxLayout(card);
+    vl->setContentsMargins(12, 10, 12, 10);
+    vl->setSpacing(4);
+
+    auto* t = new QLabel(title);
+    t->setStyleSheet(
+        QString("color: %1; font-size: 11px; font-weight: 700; background: transparent; %2").arg(colors::AMBER(), MF));
+    vl->addWidget(t);
+
+    auto* d = new QLabel(desc);
+    d->setWordWrap(true);
+    d->setStyleSheet(
+        QString("color: %1; font-size: 11px; background: transparent; %2").arg(colors::TEXT_SECONDARY(), MF));
+    vl->addWidget(d);
+
+    return card;
+}
+
+PrivacyScreen::PrivacyScreen(QWidget* parent) : QWidget(parent) {
+    setStyleSheet(QString("QWidget#PrivacyRoot { background: %1; }").arg(colors::BG_BASE()));
+    setObjectName("PrivacyRoot");
+
+    auto* root = new QVBoxLayout(this);
+    root->setContentsMargins(0, 0, 0, 0);
+
+    scroll_ = new QScrollArea;
+    scroll_->setWidgetResizable(true);
+    scroll_->setStyleSheet("QScrollArea { border: none; background: transparent; }");
+    root->addWidget(scroll_, 1);
+    // Page is built on first show — see showEvent().
+}
+
+void PrivacyScreen::showEvent(QShowEvent* event) {
+    QWidget::showEvent(event);
+    if (!page_built_) {
+        page_built_ = true;
+        scroll_->setWidget(build_page());
+    }
+}
+
+// ── Re-translation ────────────────────────────────────────────────────────────
+// Static legal text — rebuild the page on language change rather than caching
+// every label as a member. QScrollArea::setWidget() deletes the old content.
+
+void PrivacyScreen::changeEvent(QEvent* event) {
+    if (event->type() == QEvent::LanguageChange && scroll_ && page_built_) {
+        scroll_->setWidget(build_page());
+    }
+    QWidget::changeEvent(event);
+}
+
+// ── Page builder ──────────────────────────────────────────────────────────────
+
+QWidget* PrivacyScreen::build_page() {
+    auto* page = new QWidget(this);
+    page->setStyleSheet(QString("background: %1;").arg(colors::BG_BASE()));
+    auto* vl = new QVBoxLayout(page);
+    vl->setContentsMargins(24, 24, 24, 24);
+    vl->setSpacing(6);
+
+    // The pre-login info stack connects the navigate_* signals; a docked copy has
+    // no listener. Detect which host we are in and route accordingly (see the
+    // links below) rather than leaving dead buttons in the docked copy.
+    const bool in_auth_stack = isSignalConnected(QMetaMethod::fromSignal(&PrivacyScreen::navigate_back));
+
+    // Back
+    if (in_auth_stack) {
+        auto* back_btn = new QPushButton(tr("< BACK"));
+        back_btn->setCursor(Qt::PointingHandCursor);
+        back_btn->setStyleSheet(QString("QPushButton { color: %1; background: transparent; border: none; "
+                                        "font-size: 12px; %2 } QPushButton:hover { color: %3; }")
+                                    .arg(colors::TEXT_SECONDARY(), MF, colors::TEXT_PRIMARY()));
+        connect(back_btn, &QPushButton::clicked, this, &PrivacyScreen::navigate_back);
+        vl->addWidget(back_btn, 0, Qt::AlignLeft);
+    }
+
+    auto* title = new QLabel(tr("PRIVACY POLICY"));
+    title->setStyleSheet(QString("color: %1; font-size: 20px; font-weight: 700; letter-spacing: 1px; "
+                                 "background: transparent; %2")
+                             .arg(colors::AMBER(), MF));
+    vl->addWidget(title);
+
+    auto* updated = new QLabel(tr("Last updated: January 1, 2026"));
+    updated->setStyleSheet(
+        QString("color: %1; font-size: 11px; background: transparent; %2").arg(colors::TEXT_TERTIARY(), MF));
+    vl->addWidget(updated);
+    vl->addSpacing(12);
+
+    // Main panel
+    auto* panel = new QWidget(this);
+    panel->setStyleSheet(QString("background: %1; border: 1px solid %2; border-radius: 2px;")
+                             .arg(colors::BG_SURFACE(), colors::BORDER_DIM()));
+    auto* pvl = new QVBoxLayout(panel);
+    pvl->setContentsMargins(20, 16, 20, 16);
+    pvl->setSpacing(6);
+
+    // 1 — Commitment
+    pvl->addWidget(section_heading("#", tr("OUR COMMITMENT TO PRIVACY")));
+    pvl->addWidget(
+        body_text(tr("At Fincept Corporation, we are committed to protecting your privacy. This policy describes "
+                     "how we collect, use, and safeguard your personal information when you use Fincept Terminal.")));
+
+    // 2 — Information We Collect
+    pvl->addWidget(section_heading("@", tr("INFORMATION WE COLLECT")));
+    pvl->addWidget(body_text(tr("Personal Information:")));
+    pvl->addWidget(bullet(tr("Name and email address")));
+    pvl->addWidget(bullet(tr("Account credentials (encrypted)")));
+    pvl->addWidget(bullet(tr("Payment information (processed by third-party providers)")));
+    pvl->addWidget(bullet(tr("Phone number (optional)")));
+    pvl->addWidget(bullet(tr("Country and region")));
+
+    pvl->addSpacing(4);
+    pvl->addWidget(body_text(tr("Usage Information:")));
+    pvl->addWidget(bullet(tr("Feature usage and navigation patterns")));
+    pvl->addWidget(bullet(tr("Device and browser information")));
+    pvl->addWidget(bullet(tr("IP address and approximate location")));
+    pvl->addWidget(bullet(tr("Error logs and performance metrics")));
+    pvl->addWidget(bullet(tr("Session duration and frequency")));
+
+    // 3 — How We Use
+    pvl->addWidget(section_heading("*", tr("HOW WE USE YOUR INFORMATION")));
+    {
+        auto* grid = new QGridLayout;
+        grid->setSpacing(8);
+        grid->addWidget(
+            info_card(tr("SERVICE DELIVERY"),
+                      tr("Provide and maintain terminal features, process transactions, and deliver data feeds")),
+            0, 0);
+        grid->addWidget(
+            info_card(tr("SECURITY"),
+                      tr("Protect accounts, detect fraud, enforce terms of service, and ensure platform integrity")),
+            0, 1);
+        grid->addWidget(
+            info_card(tr("COMMUNICATION"),
+                      tr("Send service updates, security alerts, support responses, and optional marketing")),
+            1, 0);
+        grid->addWidget(info_card(tr("IMPROVEMENT"),
+                                  tr("Analyze usage to improve features, fix bugs, and develop new capabilities")),
+                        1, 1);
+        pvl->addLayout(grid);
+    }
+
+    // 4 — Sharing
+    pvl->addWidget(section_heading("~", tr("INFORMATION SHARING")));
+    pvl->addWidget(body_text(tr("We may share your information with:")));
+    pvl->addWidget(bullet(tr("Service Providers — third-party services that help operate the platform")));
+    pvl->addWidget(bullet(tr("Legal Requirements — when required by law or to protect our rights")));
+    pvl->addWidget(bullet(tr("Business Transfer — in connection with a merger, acquisition, or sale")));
+    pvl->addWidget(bullet(tr("With Your Consent — when you explicitly authorize sharing")));
+
+    // 5 — Security
+    pvl->addWidget(section_heading("!", tr("DATA SECURITY")));
+    pvl->addWidget(body_text(tr("We implement industry-standard security measures:")));
+    pvl->addWidget(bullet(tr("End-to-end encryption for sensitive data")));
+    pvl->addWidget(bullet(tr("Secure credential storage (encrypted at rest)")));
+    pvl->addWidget(bullet(tr("Regular security audits and penetration testing")));
+    pvl->addWidget(bullet(tr("Access controls and authentication requirements")));
+    pvl->addWidget(bullet(tr("Automatic session expiry and logout")));
+    pvl->addWidget(bullet(tr("HTTPS/TLS for all data transmission")));
+
+    // 6 — Rights
+    pvl->addWidget(section_heading("=", tr("YOUR RIGHTS")));
+    pvl->addWidget(body_text(tr("You have the right to:")));
+    pvl->addWidget(bullet(tr("Access — Request a copy of your personal data")));
+    pvl->addWidget(bullet(tr("Correction — Update inaccurate or incomplete data")));
+    pvl->addWidget(bullet(tr("Deletion — Request deletion of your account and data")));
+    pvl->addWidget(bullet(tr("Portability — Export your data in a machine-readable format")));
+    pvl->addWidget(bullet(tr("Opt-out — Unsubscribe from marketing communications")));
+
+    // 7 — Contact
+    pvl->addWidget(section_heading("@", tr("CONTACT US")));
+    pvl->addWidget(body_text(tr("Privacy Officer: support@fincept.in")));
+    pvl->addWidget(body_text(tr("For privacy-related inquiries, write to the address above.")));
+
+    vl->addWidget(panel);
+
+    // Footer navigation
+    auto* footer = new QWidget(this);
+    footer->setStyleSheet("background: transparent;");
+    auto* fhl = new QHBoxLayout(footer);
+    fhl->setContentsMargins(0, 12, 0, 0);
+
+    auto make_link = [](const QString& text) {
+        auto* btn = new QPushButton(text);
+        btn->setCursor(Qt::PointingHandCursor);
+        btn->setStyleSheet(QString("QPushButton { color: %1; background: transparent; border: none; "
+                                   "font-size: 12px; font-family:'Consolas','Courier New',monospace; }"
+                                   "QPushButton:hover { color: #38bdf8; }")
+                               .arg(colors::CYAN()));
+        return btn;
+    };
+
+    // Docked copy: open the target as its own dock panel via the navigation bus.
+    auto open_panel = [](const char* screen_id) {
+        EventBus::instance().publish(QStringLiteral("nav.switch_screen"),
+                                     QVariantMap{{QStringLiteral("screen_id"), QString::fromLatin1(screen_id)}});
+    };
+
+    auto* terms_link = make_link(tr("Terms of Service"));
+    connect(terms_link, &QPushButton::clicked, this, [this, in_auth_stack, open_panel]() {
+        if (in_auth_stack)
+            emit navigate_terms();
+        else
+            open_panel("terms");
+    });
+    fhl->addWidget(terms_link);
+
+    fhl->addStretch();
+
+    auto* contact_link = make_link(tr("Contact Us"));
+    connect(contact_link, &QPushButton::clicked, this, [this, in_auth_stack, open_panel]() {
+        if (in_auth_stack)
+            emit navigate_contact();
+        else
+            open_panel("contact");
+    });
+    fhl->addWidget(contact_link);
+
+    vl->addWidget(footer);
+    vl->addStretch();
+
+    return page;
+}
+
+} // namespace fincept::screens

@@ -1,0 +1,132 @@
+#pragma once
+
+#include "screens/common/IStatefulScreen.h"
+
+#include <QComboBox>
+#include <QEvent>
+#include <QJsonArray>
+#include <QJsonObject>
+#include <QLabel>
+#include <QLineEdit>
+#include <QListWidget>
+#include <QPushButton>
+#include <QStackedWidget>
+#include <QTableWidget>
+#include <QTextEdit>
+#include <QWidget>
+
+namespace fincept::screens {
+
+/// Stock category descriptor for the Asia Markets explorer.
+struct StockCategory {
+    QString id;
+    QString name;
+    QString script;
+    QString color; // hex color for the tab
+    int endpoint_count;
+};
+
+/// Asia Markets Terminal — 398+ AKShare stock endpoints for
+/// Chinese A/B shares, Hong Kong, and US markets.
+/// 8 categories: Realtime, Historical, Financial, Holdings,
+/// Fund Flow, Boards, Margin/HSGT, Hot & News.
+class AsiaMarketsScreen : public QWidget, public IStatefulScreen {
+    Q_OBJECT
+  public:
+    explicit AsiaMarketsScreen(QWidget* parent = nullptr);
+
+    void restore_state(const QVariantMap& state) override;
+    QVariantMap save_state() const override;
+    QString state_key() const override { return "asia_markets"; }
+    int state_version() const override { return 1; }
+
+  protected:
+    void showEvent(QShowEvent* e) override;
+    void changeEvent(QEvent* event) override;
+
+  private slots:
+    void on_category_changed(int index);
+    void on_region_changed(int index);
+    void on_endpoint_clicked(QListWidgetItem* item);
+    void on_search_changed(const QString& text);
+    void on_execute();
+    void on_view_toggle();
+    void on_refresh();
+
+  private:
+    void setup_ui();
+    bool first_show_ = true;
+    QWidget* create_header();
+    QWidget* create_category_bar();
+    QWidget* create_left_panel();
+    QWidget* create_data_panel();
+    QWidget* create_status_bar();
+
+    /// Re-apply tr() lookups to every widget whose text we keep a handle to.
+    /// Called from changeEvent() on QEvent::LanguageChange.
+    void retranslateUi();
+
+    void load_endpoints(int cat_index);
+    void populate_endpoint_list(const QJsonObject& result);
+    /// `force` skips (and evicts) the 2-minute result cache — used by REFRESH.
+    void execute_query(const QString& endpoint, const QStringList& extra_args, bool force = false);
+    void run_query(bool force);
+    void display_table(const QJsonArray& data, const QStringList& columns = {});
+    void display_json(const QJsonArray& data);
+    void display_error(const QString& error);
+    void set_loading(bool loading);
+
+    // Categories
+    QList<StockCategory> categories_;
+    int active_category_ = 0;
+
+    // Market regions
+    QStringList regions_ = {"CN_A", "CN_B", "HK", "US"};
+    int active_region_ = 0;
+
+    // Endpoint cache per script
+    QHash<QString, QJsonObject> endpoint_cache_;
+    QString active_endpoint_;
+
+    // UI — category bar
+    QList<QPushButton*> cat_btns_;
+    QList<QPushButton*> region_btns_;
+
+    // UI — header (cached for retranslateUi)
+    QLabel* header_title_ = nullptr;
+    QLabel* header_sub_ = nullptr;
+
+    // UI — left panel
+    QListWidget* endpoint_list_ = nullptr;
+    QLineEdit* search_input_ = nullptr;
+    QLineEdit* symbol_input_ = nullptr;
+    QLabel* endpoint_count_label_ = nullptr;
+    QLabel* sym_label_ = nullptr; // (cached for retranslateUi)
+
+    // UI — data panel
+    QStackedWidget* view_stack_ = nullptr;
+    QTableWidget* data_table_ = nullptr;
+    QTextEdit* json_view_ = nullptr;
+    QPushButton* view_toggle_btn_ = nullptr;
+    QPushButton* exec_btn_ = nullptr;
+    QPushButton* refresh_btn_ = nullptr; // (cached for retranslateUi)
+    QLabel* data_status_ = nullptr;
+    QLabel* record_count_ = nullptr;
+
+    // UI — status bar
+    QLabel* status_left_ = nullptr; // (cached for retranslateUi)
+    QLabel* status_category_ = nullptr;
+    QLabel* status_region_ = nullptr;
+
+    bool is_table_view_ = true;
+    bool loading_ = false;
+    QJsonArray last_data_;
+
+    // Bumped whenever the category or the query changes; an async callback that finds a different
+    // value is stale (e.g. category A's endpoint list arriving after the user moved on to B, which
+    // used to auto-run A's endpoint through B's script) and must not touch the UI.
+    int request_seq_ = 0;
+    QString pending_endpoint_; // endpoint to re-select once the list is populated (restore_state)
+};
+
+} // namespace fincept::screens

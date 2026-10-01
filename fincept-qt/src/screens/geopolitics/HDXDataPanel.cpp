@@ -1,0 +1,545 @@
+// src/screens/geopolitics/HDXDataPanel.cpp
+#include "screens/geopolitics/HDXDataPanel.h"
+
+#include "services/geopolitics/GeopoliticsService.h"
+#include "ui/theme/Theme.h"
+
+#include <QDesktopServices>
+#include <QHBoxLayout>
+#include <QHeaderView>
+#include <QScrollArea>
+#include <QUrl>
+
+namespace fincept::screens {
+
+using namespace fincept::services::geo;
+
+// Helper: get cyan accent RGB string for rgba() usage
+static QString cyan_rgb() {
+    QColor c(ui::colors::CYAN());
+    return QString("%1,%2,%3").arg(c.red()).arg(c.green()).arg(c.blue());
+}
+
+HDXDataPanel::HDXDataPanel(QWidget* parent) : QWidget(parent) {
+    build_ui();
+    connect_service();
+}
+
+void HDXDataPanel::connect_service() {
+    auto& svc = GeopoliticsService::instance();
+    connect(&svc, &GeopoliticsService::hdx_results_loaded, this, &HDXDataPanel::on_hdx_results);
+    // Without this the panel hangs on "Loading HDX data…" forever whenever the
+    // fetch fails (and re-fires the failing request on every tab switch).
+    connect(&svc, &GeopoliticsService::error_occurred, this, &HDXDataPanel::on_error);
+}
+
+void HDXDataPanel::on_error(const QString& context, const QString& message) {
+    // GeopoliticsService::error_occurred is a shared channel — an events or
+    // categories failure used to blank this table and replace it with an "HDX
+    // failed" message that had nothing to do with HDX. Only react to our own
+    // contexts.
+    static const QStringList kHdxContexts = {QStringLiteral("conflicts"), QStringLiteral("humanitarian"),
+                                             QStringLiteral("search"), QStringLiteral("topic"),
+                                             QStringLiteral("country")};
+    if (!kHdxContexts.contains(context) && !context.startsWith(QStringLiteral("hdx")))
+        return;
+
+    // Stop the perpetual spinner and surface the failure in its place.
+    inflight_.clear();
+    if (datasets_table_)
+        datasets_table_->setRowCount(0);
+    if (dataset_count_)
+        dataset_count_->setText(tr("0 datasets"));
+    show_message(tr("Failed to load HDX data (%1):\n%2\n\nAdjust the query and search again.").arg(context, message));
+}
+
+void HDXDataPanel::build_ui() {
+    auto* root = new QVBoxLayout(this);
+    root->setContentsMargins(0, 0, 0, 0);
+    root->setSpacing(0);
+
+    // Header with view tabs
+    auto* header = new QWidget(this);
+    header->setFixedHeight(48);
+    header->setStyleSheet(
+        QString("background:%1; border-bottom:1px solid %2;").arg(ui::colors::BG_RAISED(), ui::colors::BORDER_DIM()));
+    auto* hhl = new QHBoxLayout(header);
+    hhl->setContentsMargins(16, 0, 16, 0);
+    hhl->setSpacing(8);
+
+    title_lbl_ = new QLabel(tr("HDX HUMANITARIAN DATA"), header);
+    title_lbl_->setStyleSheet(QString("color:%1; font-size:%2px; font-weight:700; font-family:%3; letter-spacing:1px;")
+                                  .arg(ui::colors::CYAN())
+                                  .arg(ui::fonts::TINY)
+                                  .arg(ui::fonts::DATA_FAMILY()));
+    hhl->addWidget(title_lbl_);
+
+    auto* div = new QWidget(header);
+    div->setFixedSize(1, 20);
+    div->setStyleSheet(QString("background:%1;").arg(ui::colors::BORDER_DIM()));
+    hhl->addWidget(div);
+
+    auto rgb = cyan_rgb();
+    const QStringList views = {tr("Conflicts"), tr("Humanitarian"), tr("Explorer"), tr("Datasets")};
+    view_labels_ = views;
+    for (int i = 0; i < views.size(); ++i) {
+        auto* btn = new QPushButton(views[i].toUpper(), header);
+        btn->setCursor(Qt::PointingHandCursor);
+        btn->setStyleSheet(QString("QPushButton { color:%1; font-size:%2px; font-family:%3;"
+                                   "padding:4px 12px; border:none; background:transparent;"
+                                   "font-weight:400; }"
+                                   "QPushButton:hover { color:%4; background:rgba(%5,0.04); }")
+                               .arg(ui::colors::TEXT_TERTIARY())
+                               .arg(ui::fonts::TINY)
+                               .arg(ui::fonts::DATA_FAMILY)
+                               .arg(ui::colors::CYAN())
+                               .arg(rgb));
+        connect(btn, &QPushButton::clicked, this, [this, i]() { on_view_changed(i); });
+        hhl->addWidget(btn);
+        view_buttons_.append(btn);
+    }
+
+    hhl->addStretch();
+
+    search_edit_ = new QLineEdit(header);
+    search_edit_->setPlaceholderText(tr("Search HDX datasets..."));
+    search_edit_->setFixedWidth(240);
+    search_edit_->setStyleSheet(QString("QLineEdit { background:%1; color:%2; border:1px solid %3;"
+                                        "font-family:%4; font-size:%5px; padding:4px 8px; }"
+                                        "QLineEdit:focus { border-color:%6; }")
+                                    .arg(ui::colors::BG_RAISED(), ui::colors::TEXT_PRIMARY(), ui::colors::BORDER_MED())
+                                    .arg(ui::fonts::DATA_FAMILY)
+                                    .arg(ui::fonts::SMALL)
+                                    .arg(ui::colors::CYAN()));
+    connect(search_edit_, &QLineEdit::returnPressed, this, [this]() {
+        auto q = search_edit_->text().trimmed();
+        if (!q.isEmpty()) {
+            // Results arrive as the "search" context, which only the Datasets view
+            // renders - searching from any other tab left the panel on "Loading"
+            // forever. Switch there first (without its default query).
+            set_active_view(3);
+            show_loading(true);
+            inflight_.insert(QStringLiteral("search"));
+            GeopoliticsService::instance().search_hdx_advanced(q);
+        }
+    });
+    hhl->addWidget(search_edit_);
+
+    dataset_count_ = new QLabel(tr("0 datasets"), header);
+    dataset_count_->setFixedHeight(22);
+    dataset_count_->setStyleSheet(QString("color:%1; font-size:%2px; font-family:%3; padding:2px 6px;"
+                                          "background:rgba(%4,0.08); border:1px solid rgba(%4,0.25); font-weight:700;")
+                                      .arg(ui::colors::CYAN())
+                                      .arg(ui::fonts::TINY)
+                                      .arg(ui::fonts::DATA_FAMILY())
+                                      .arg(rgb));
+    hhl->addWidget(dataset_count_);
+
+    root->addWidget(header);
+
+    // Datasets table
+    datasets_table_ = new QTableWidget(this);
+    datasets_table_->setColumnCount(5);
+    datasets_table_->setHorizontalHeaderLabels(
+        {tr("Title"), tr("Organization"), tr("Date"), tr("Resources"), tr("Tags")});
+    datasets_table_->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    datasets_table_->setSelectionBehavior(QAbstractItemView::SelectRows);
+    datasets_table_->setAlternatingRowColors(true);
+    datasets_table_->verticalHeader()->setVisible(false);
+    datasets_table_->setSortingEnabled(true);
+
+    datasets_table_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
+    datasets_table_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+    datasets_table_->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+    datasets_table_->horizontalHeader()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
+    datasets_table_->horizontalHeader()->setSectionResizeMode(4, QHeaderView::ResizeToContents);
+
+    datasets_table_->verticalHeader()->setDefaultSectionSize(26);
+
+    datasets_table_->setStyleSheet(
+        QString("QTableWidget { background:%1; color:%2; gridline-color:%3;"
+                "font-family:%4; font-size:%5px; border:none; }"
+                "QTableWidget::item { padding:3px 8px; }"
+                "QTableWidget::item:selected { background:rgba(%6,0.15); }"
+                "QHeaderView::section { background:%7; color:%8; font-weight:700;"
+                "padding:5px 8px; border:1px solid %3; font-family:%4; font-size:%5px; }"
+                "QTableWidget::item:alternate { background:%9; }")
+            .arg(ui::colors::BG_SURFACE(), ui::colors::TEXT_PRIMARY(), ui::colors::BORDER_DIM())
+            .arg(ui::fonts::DATA_FAMILY)
+            .arg(ui::fonts::SMALL)
+            .arg(rgb)
+            .arg(ui::colors::BG_RAISED())
+            .arg(ui::colors::TEXT_SECONDARY())
+            .arg(ui::colors::ROW_ALT()));
+
+    datasets_table_->setAccessibleName(tr("HDX datasets"));
+    datasets_table_->setAccessibleDescription(
+        tr("Humanitarian Data Exchange datasets. Press Enter on a row to open it on data.humdata.org."));
+    // Open the dataset's HDX page. Every CKAN dataset is addressable by its
+    // name/id, so a row is actionable rather than a dead end.
+    connect(datasets_table_, &QTableWidget::cellActivated, this, [this](int row, int) {
+        if (row < 0)
+            return;
+        auto* it = datasets_table_->item(row, 0);
+        if (!it)
+            return;
+        const QString url = it->data(Qt::UserRole).toString();
+        if (!url.isEmpty())
+            QDesktopServices::openUrl(QUrl(url));
+    });
+
+    // Loading overlay
+    loading_label_ = new QLabel(tr("Loading HDX data..."), this);
+    loading_label_->setAlignment(Qt::AlignCenter);
+    loading_label_->setStyleSheet(QString("color:%1; font-size:%2px; font-family:%3; background:%4;")
+                                      .arg(ui::colors::CYAN())
+                                      .arg(ui::fonts::DATA)
+                                      .arg(ui::fonts::DATA_FAMILY)
+                                      .arg(ui::colors::BG_SURFACE()));
+    loading_label_->hide();
+    root->addWidget(loading_label_, 1);
+    root->addWidget(datasets_table_, 1);
+
+    // Explorer filter bar
+    explorer_bar_ = new QWidget(this);
+    explorer_bar_->setFixedHeight(44);
+    explorer_bar_->setStyleSheet(
+        QString("background:%1; border-top:1px solid %2;").arg(ui::colors::BG_RAISED(), ui::colors::BORDER_DIM()));
+    auto* ehl = new QHBoxLayout(explorer_bar_);
+    ehl->setContentsMargins(16, 0, 16, 0);
+    ehl->setSpacing(8);
+
+    auto combo_style = QString("QComboBox { background:%1; color:%2; border:1px solid %3;"
+                               "font-family:%4; font-size:%5px; padding:4px 6px; }")
+                           .arg(ui::colors::BG_RAISED(), ui::colors::TEXT_PRIMARY(), ui::colors::BORDER_MED())
+                           .arg(ui::fonts::DATA_FAMILY)
+                           .arg(ui::fonts::SMALL);
+
+    auto bar_label_style = QString("color:%1; font-size:%2px; font-family:%3; font-weight:700; letter-spacing:1px;")
+                               .arg(ui::colors::TEXT_TERTIARY())
+                               .arg(ui::fonts::TINY)
+                               .arg(ui::fonts::DATA_FAMILY);
+
+    country_lbl_ = new QLabel(tr("COUNTRY:"), explorer_bar_);
+    country_lbl_->setStyleSheet(bar_label_style);
+    ehl->addWidget(country_lbl_);
+    country_combo_ = new QComboBox(explorer_bar_);
+    country_combo_->setStyleSheet(combo_style);
+    country_combo_->setEditable(true);
+    for (const auto& r : critical_regions())
+        country_combo_->addItem(r);
+    // Start empty: a pre-selected country always won over the topic box, so the
+    // topic could never be used without first clearing the country by hand.
+    country_combo_->setCurrentIndex(-1);
+    if (country_combo_->lineEdit())
+        country_combo_->lineEdit()->setPlaceholderText(tr("Select country"));
+    country_combo_->setToolTip(tr("Country (or ISO3 code). Leave empty to search by topic instead."));
+    ehl->addWidget(country_combo_);
+
+    topic_lbl_ = new QLabel(tr("TOPIC:"), explorer_bar_);
+    topic_lbl_->setStyleSheet(bar_label_style);
+    ehl->addWidget(topic_lbl_);
+    topic_combo_ = new QComboBox(explorer_bar_);
+    topic_combo_->setStyleSheet(combo_style);
+    // Topic values are search query keys passed to the HDX service — not UI labels.
+    topic_combo_->addItems(
+        {"conflict", "humanitarian", "displacement", "food security", "health", "education", "refugees"});
+    ehl->addWidget(topic_combo_);
+
+    explore_btn_ = new QPushButton(tr("SEARCH"), explorer_bar_);
+    explore_btn_->setCursor(Qt::PointingHandCursor);
+    {
+        QColor cy(ui::colors::CYAN());
+        explore_btn_->setStyleSheet(QString("QPushButton { background:%1; color:%2; font-family:%3;"
+                                            "font-size:%4px; font-weight:700; border:none; padding:6px 16px; }"
+                                            "QPushButton:hover { background:%5; }")
+                                        .arg(ui::colors::CYAN())
+                                        .arg(ui::colors::BG_BASE())
+                                        .arg(ui::fonts::DATA_FAMILY())
+                                        .arg(ui::fonts::SMALL)
+                                        .arg(cy.darker(120).name()));
+    }
+    connect(explore_btn_, &QPushButton::clicked, this, [this]() {
+        auto country = country_combo_->currentText().trimmed();
+        if (!country.isEmpty()) {
+            show_loading(true);
+            inflight_.insert(QStringLiteral("country"));
+            GeopoliticsService::instance().search_hdx_by_country(country);
+        } else {
+            auto topic = topic_combo_->currentText().trimmed();
+            if (!topic.isEmpty()) {
+                show_loading(true);
+                inflight_.insert(QStringLiteral("topic"));
+                GeopoliticsService::instance().search_hdx_by_topic(topic);
+            } else {
+                show_message(tr("Enter a country or pick a topic, then press SEARCH."));
+            }
+        }
+    });
+    ehl->addWidget(explore_btn_);
+    ehl->addStretch();
+
+    root->addWidget(explorer_bar_);
+
+    // Source + licence attribution. HDX redistribution terms require the
+    // source and the per-dataset licence to travel with the data; the panel
+    // previously showed dataset rows with neither.
+    attribution_lbl_ = new QLabel(this);
+    attribution_lbl_->setTextFormat(Qt::RichText);
+    attribution_lbl_->setOpenExternalLinks(true);
+    attribution_lbl_->setWordWrap(true);
+    attribution_lbl_->setText(tr("Source: <a href=\"https://data.humdata.org\">Humanitarian Data Exchange (HDX)</a>, "
+                                 "OCHA. Each dataset carries its own licence and attribution — open the dataset page "
+                                 "before redistributing or citing it."));
+    attribution_lbl_->setStyleSheet(QString("color:%1; font-size:%2px; font-family:%3; padding:4px 16px;"
+                                            "background:%4; border-top:1px solid %5;")
+                                        .arg(ui::colors::TEXT_TERTIARY())
+                                        .arg(ui::fonts::TINY)
+                                        .arg(ui::fonts::DATA_FAMILY())
+                                        .arg(ui::colors::BG_SURFACE())
+                                        .arg(ui::colors::BORDER_DIM()));
+    root->addWidget(attribution_lbl_);
+
+    // Style + visibility only: the first fetch waits for showEvent().
+    set_active_view(0);
+}
+
+void HDXDataPanel::showEvent(QShowEvent* event) {
+    QWidget::showEvent(event);
+    if (!shown_once_) {
+        shown_once_ = true;
+        load_view(active_view_);
+    }
+}
+
+void HDXDataPanel::on_view_changed(int index) {
+    set_active_view(index);
+    // Never fetch for a panel nobody has looked at yet (constructor / restore paths).
+    if (shown_once_)
+        load_view(index);
+}
+
+void HDXDataPanel::set_active_view(int index) {
+    active_view_ = index;
+    auto rgb = cyan_rgb();
+    for (int i = 0; i < view_buttons_.size(); ++i) {
+        const bool active = (i == index);
+        if (active) {
+            view_buttons_[i]->setStyleSheet(
+                QString("QPushButton { color:%1; font-size:%2px; font-family:%3;"
+                        "padding:4px 12px;"
+                        "border-bottom:2px solid %1; border-top:none; border-left:none; border-right:none;"
+                        "background:rgba(%4,0.06); font-weight:700; }"
+                        "QPushButton:hover { background:rgba(%4,0.10); }")
+                    .arg(ui::colors::CYAN())
+                    .arg(ui::fonts::TINY)
+                    .arg(ui::fonts::DATA_FAMILY)
+                    .arg(rgb));
+        } else {
+            view_buttons_[i]->setStyleSheet(QString("QPushButton { color:%1; font-size:%2px; font-family:%3;"
+                                                    "padding:4px 12px; border:none; background:transparent;"
+                                                    "font-weight:400; }"
+                                                    "QPushButton:hover { color:%4; background:rgba(%5,0.04); }")
+                                                .arg(ui::colors::TEXT_TERTIARY())
+                                                .arg(ui::fonts::TINY)
+                                                .arg(ui::fonts::DATA_FAMILY)
+                                                .arg(ui::colors::CYAN())
+                                                .arg(rgb));
+        }
+    }
+
+    if (explorer_bar_)
+        explorer_bar_->setVisible(index == 2);
+}
+
+void HDXDataPanel::load_view(int index) {
+    auto& svc = GeopoliticsService::instance();
+    // Show whatever is cached; otherwise fetch once (an in-flight request will
+    // render itself when it lands, so a second tab flip must not issue another).
+    auto show_or_fetch = [this](const QVector<HDXDataset>& cache, const QString& ctx, const auto& fetch) {
+        if (!cache.isEmpty()) {
+            populate_table(cache);
+        } else {
+            show_loading(true);
+            if (!inflight_.contains(ctx)) {
+                inflight_.insert(ctx);
+                fetch();
+            }
+        }
+    };
+    switch (index) {
+        case 0:
+            show_or_fetch(cache_conflicts_, QStringLiteral("conflicts"), [&svc]() { svc.search_hdx_conflicts(); });
+            break;
+        case 1:
+            show_or_fetch(cache_humanitarian_, QStringLiteral("humanitarian"),
+                          [&svc]() { svc.search_hdx_humanitarian(); });
+            break;
+        case 2:
+            // Explorer is query-driven: show the last result, else prompt.
+            if (!cache_explorer_.isEmpty())
+                populate_table(cache_explorer_);
+            else if (inflight_.contains(QStringLiteral("country")) || inflight_.contains(QStringLiteral("topic")))
+                show_loading(true);
+            else
+                show_message(tr("Enter a country or pick a topic, then press SEARCH."));
+            break;
+        case 3:
+            show_or_fetch(cache_datasets_, QStringLiteral("search"),
+                          [&svc]() { svc.search_hdx_advanced("humanitarian crisis conflict displacement"); });
+            break;
+        default:
+            break;
+    }
+}
+
+void HDXDataPanel::explore_country(const QString& country) {
+    if (country.trimmed().isEmpty())
+        return;
+    set_active_view(2);
+    country_combo_->setCurrentText(country.trimmed());
+    show_loading(true);
+    inflight_.insert(QStringLiteral("country"));
+    GeopoliticsService::instance().search_hdx_by_country(country.trimmed());
+}
+
+void HDXDataPanel::explore_topic(const QString& topic) {
+    if (topic.trimmed().isEmpty())
+        return;
+    set_active_view(2);
+    country_combo_->setCurrentText(QString()); // topic search runs only with no country
+    const int idx = topic_combo_->findText(topic.trimmed(), Qt::MatchFixedString);
+    if (idx >= 0)
+        topic_combo_->setCurrentIndex(idx);
+    show_loading(true);
+    inflight_.insert(QStringLiteral("topic"));
+    GeopoliticsService::instance().search_hdx_by_topic(topic.trimmed());
+}
+
+void HDXDataPanel::show_loading(bool on) {
+    if (on && loading_label_)
+        loading_label_->setText(tr("Loading HDX data...")); // may still hold an old error / empty message
+    loading_label_->setVisible(on);
+    datasets_table_->setVisible(!on);
+}
+
+void HDXDataPanel::show_message(const QString& text) {
+    if (loading_label_) {
+        loading_label_->setText(text);
+        loading_label_->setVisible(true);
+    }
+    if (datasets_table_)
+        datasets_table_->setVisible(false);
+}
+
+void HDXDataPanel::on_hdx_results(const QString& context, QVector<HDXDataset> datasets) {
+    inflight_.remove(context);
+    if (context == "conflicts")
+        cache_conflicts_ = datasets;
+    else if (context == "humanitarian")
+        cache_humanitarian_ = datasets;
+    else if (context == "topic" || context == "country")
+        cache_explorer_ = datasets;
+    else if (context == "search")
+        cache_datasets_ = datasets;
+
+    bool relevant = (active_view_ == 0 && context == "conflicts") || (active_view_ == 1 && context == "humanitarian") ||
+                    (active_view_ == 2 && (context == "country" || context == "topic")) ||
+                    (active_view_ == 3 && context == "search");
+    if (relevant)
+        populate_table(datasets);
+}
+
+void HDXDataPanel::populate_table(const QVector<HDXDataset>& datasets) {
+    show_loading(false);
+    datasets_table_->setSortingEnabled(false);
+    datasets_table_->setRowCount(datasets.size());
+
+    for (int i = 0; i < datasets.size(); ++i) {
+        const auto& d = datasets[i];
+        auto* title_item = new QTableWidgetItem(d.title);
+        // Per-dataset licence + link. HDX carries licence metadata on the CKAN
+        // record; surface whatever the payload has so the user can see the
+        // terms without leaving the terminal, and stash the dataset URL for
+        // the row-activation handler.
+        const QString licence = d.raw.value(QStringLiteral("license_title")).toString();
+        const QString name = d.raw.value(QStringLiteral("name")).toString();
+        const QString url = !name.isEmpty() ? QStringLiteral("https://data.humdata.org/dataset/") + name
+                            : !d.id.isEmpty() ? QStringLiteral("https://data.humdata.org/dataset/") + d.id
+                                              : QString();
+        title_item->setData(Qt::UserRole, url);
+        QString tip = d.notes;
+        if (!licence.isEmpty())
+            tip += (tip.isEmpty() ? QString() : QStringLiteral("\n\n")) + tr("Licence: %1").arg(licence);
+        if (!url.isEmpty())
+            tip += (tip.isEmpty() ? QString() : QStringLiteral("\n")) + url;
+        title_item->setToolTip(tip);
+        datasets_table_->setItem(i, 0, title_item);
+
+        auto* org_item = new QTableWidgetItem(d.organization);
+        if (!licence.isEmpty())
+            org_item->setToolTip(tr("Licence: %1").arg(licence));
+        datasets_table_->setItem(i, 1, org_item);
+        datasets_table_->setItem(i, 2, new QTableWidgetItem(d.date));
+
+        auto* res_item = new QTableWidgetItem(QString::number(d.num_resources));
+        res_item->setTextAlignment(Qt::AlignCenter);
+        datasets_table_->setItem(i, 3, res_item);
+
+        datasets_table_->setItem(i, 4, new QTableWidgetItem(d.tags.join(", ")));
+    }
+
+    datasets_table_->setSortingEnabled(true);
+    dataset_count_->setText(tr("%1 datasets").arg(datasets.size()));
+
+    // Empty result is a state, not a silent blank grid.
+    if (datasets.isEmpty())
+        show_message(tr("No HDX datasets matched this query.\nTry a broader term or a different country."));
+}
+
+void HDXDataPanel::changeEvent(QEvent* event) {
+    if (event->type() == QEvent::LanguageChange)
+        retranslateUi();
+    QWidget::changeEvent(event);
+}
+
+void HDXDataPanel::retranslateUi() {
+    if (title_lbl_)
+        title_lbl_->setText(tr("HDX HUMANITARIAN DATA"));
+    if (search_edit_)
+        search_edit_->setPlaceholderText(tr("Search HDX datasets..."));
+    if (loading_label_)
+        loading_label_->setText(tr("Loading HDX data..."));
+
+    // View-tab buttons — re-apply the fixed labels (upper-cased) in order.
+    const QStringList views = {tr("Conflicts"), tr("Humanitarian"), tr("Explorer"), tr("Datasets")};
+    view_labels_ = views;
+    for (int i = 0; i < view_buttons_.size() && i < views.size(); ++i)
+        if (view_buttons_[i])
+            view_buttons_[i]->setText(views[i].toUpper());
+
+    // Explorer filter bar
+    if (country_lbl_)
+        country_lbl_->setText(tr("COUNTRY:"));
+    if (topic_lbl_)
+        topic_lbl_->setText(tr("TOPIC:"));
+    if (country_combo_ && country_combo_->lineEdit())
+        country_combo_->lineEdit()->setPlaceholderText(tr("Select country"));
+    if (explore_btn_)
+        explore_btn_->setText(tr("SEARCH"));
+
+    // Table headers
+    if (datasets_table_)
+        datasets_table_->setHorizontalHeaderLabels(
+            {tr("Title"), tr("Organization"), tr("Date"), tr("Resources"), tr("Tags")});
+
+    if (attribution_lbl_)
+        attribution_lbl_->setText(
+            tr("Source: <a href=\"https://data.humdata.org\">Humanitarian Data Exchange (HDX)</a>, "
+               "OCHA. Each dataset carries its own licence and attribution — open the dataset page "
+               "before redistributing or citing it."));
+
+    // dataset_count_ reflects the last populate_table() and refreshes on next load.
+}
+
+} // namespace fincept::screens

@@ -1,0 +1,187 @@
+#include "screens/info/TrademarksScreen.h"
+
+#include "ui/theme/Theme.h"
+
+#include <QEvent>
+#include <QLabel>
+#include <QMetaMethod>
+#include <QPushButton>
+#include <QScrollArea>
+#include <QShowEvent>
+#include <QVBoxLayout>
+
+namespace fincept::screens {
+
+using namespace fincept::ui;
+
+static const char* MF = "font-family:'Consolas','Courier New',monospace;";
+
+static QLabel* heading(const QString& num, const QString& title) {
+    auto* lbl = new QLabel(QString("%1. %2").arg(num, title));
+    lbl->setStyleSheet(QString("color: %1; font-size: 14px; font-weight: 700; "
+                               "background: transparent; margin-top: 8px; %2")
+                           .arg(colors::AMBER(), MF));
+    return lbl;
+}
+
+static QLabel* body(const QString& text) {
+    auto* lbl = new QLabel(text);
+    lbl->setWordWrap(true);
+    lbl->setStyleSheet(
+        QString("color: %1; font-size: 12px; background: transparent; %2").arg(colors::TEXT_PRIMARY(), MF));
+    return lbl;
+}
+
+static QLabel* bullet(const QString& text) {
+    auto* lbl = new QLabel(QString("  > %1").arg(text));
+    lbl->setWordWrap(true);
+    lbl->setStyleSheet(
+        QString("color: %1; font-size: 12px; background: transparent; %2").arg(colors::TEXT_SECONDARY(), MF));
+    return lbl;
+}
+
+TrademarksScreen::TrademarksScreen(QWidget* parent) : QWidget(parent) {
+    setStyleSheet(QString("QWidget#TmRoot { background: %1; }").arg(colors::BG_BASE()));
+    setObjectName("TmRoot");
+
+    auto* root = new QVBoxLayout(this);
+    root->setContentsMargins(0, 0, 0, 0);
+
+    scroll_ = new QScrollArea;
+    scroll_->setWidgetResizable(true);
+    scroll_->setStyleSheet("QScrollArea { border: none; background: transparent; }");
+    root->addWidget(scroll_, 1);
+    // Page is built on first show — see showEvent().
+}
+
+void TrademarksScreen::showEvent(QShowEvent* event) {
+    QWidget::showEvent(event);
+    if (!page_built_) {
+        page_built_ = true;
+        scroll_->setWidget(build_page());
+    }
+}
+
+// ── Re-translation ────────────────────────────────────────────────────────────
+// Static legal text — rebuild the page on language change rather than caching
+// every label as a member. QScrollArea::setWidget() deletes the old content.
+
+void TrademarksScreen::changeEvent(QEvent* event) {
+    if (event->type() == QEvent::LanguageChange && scroll_ && page_built_) {
+        scroll_->setWidget(build_page());
+    }
+    QWidget::changeEvent(event);
+}
+
+// ── Page builder ──────────────────────────────────────────────────────────────
+
+QWidget* TrademarksScreen::build_page() {
+    auto* page = new QWidget(this);
+    page->setStyleSheet(QString("background: %1;").arg(colors::BG_BASE()));
+    auto* vl = new QVBoxLayout(page);
+    vl->setContentsMargins(24, 24, 24, 24);
+    vl->setSpacing(6);
+
+    // Back: the pre-login info stack connects navigate_back; a docked copy has no
+    // listener, so omit the (dead) button there.
+    if (isSignalConnected(QMetaMethod::fromSignal(&TrademarksScreen::navigate_back))) {
+        auto* back_btn = new QPushButton(tr("< BACK"));
+        back_btn->setCursor(Qt::PointingHandCursor);
+        back_btn->setStyleSheet(QString("QPushButton { color: %1; background: transparent; border: none; "
+                                        "font-size: 12px; %2 } QPushButton:hover { color: %3; }")
+                                    .arg(colors::TEXT_SECONDARY(), MF, colors::TEXT_PRIMARY()));
+        connect(back_btn, &QPushButton::clicked, this, &TrademarksScreen::navigate_back);
+        vl->addWidget(back_btn, 0, Qt::AlignLeft);
+    }
+
+    auto* title = new QLabel(tr("TRADEMARKS"));
+    title->setStyleSheet(QString("color: %1; font-size: 20px; font-weight: 700; letter-spacing: 1px; "
+                                 "background: transparent; %2")
+                             .arg(colors::AMBER(), MF));
+    vl->addWidget(title);
+
+    auto* updated = new QLabel(tr("Last updated: January 1, 2026"));
+    updated->setStyleSheet(
+        QString("color: %1; font-size: 11px; background: transparent; %2").arg(colors::TEXT_TERTIARY(), MF));
+    vl->addWidget(updated);
+    vl->addSpacing(12);
+
+    // Panel
+    auto* panel = new QWidget(this);
+    panel->setStyleSheet(QString("background: %1; border: 1px solid %2; border-radius: 2px;")
+                             .arg(colors::BG_SURFACE(), colors::BORDER_DIM()));
+    auto* pvl = new QVBoxLayout(panel);
+    pvl->setContentsMargins(20, 16, 20, 16);
+    pvl->setSpacing(6);
+
+    pvl->addWidget(heading("1", tr("FINCEPT TRADEMARKS")));
+    // Trademark marks themselves are brand strings — shown verbatim, not translated.
+    pvl->addWidget(bullet("Fincept (TM)"));
+    pvl->addWidget(bullet("Fincept Terminal (TM)"));
+    pvl->addWidget(bullet("Fincept Corporation (TM)"));
+    pvl->addWidget(bullet(tr("Fincept Logo and associated visual identities")));
+
+    pvl->addWidget(heading("2", tr("THIRD-PARTY TRADEMARKS")));
+    pvl->addWidget(body(tr("The following are trademarks of their respective owners:")));
+    // Proprietary marks + owning entities — brand strings, shown verbatim.
+    pvl->addWidget(bullet("Reuters — Thomson Reuters Corporation"));
+    pvl->addWidget(bullet("S&P 500 — S&P Dow Jones Indices LLC"));
+    pvl->addWidget(bullet("NASDAQ — Nasdaq, Inc."));
+    pvl->addWidget(bullet("NYSE — Intercontinental Exchange, Inc."));
+    pvl->addWidget(bullet("FTSE — FTSE International Limited"));
+
+    pvl->addWidget(heading("3", tr("TRADEMARK GUIDELINES")));
+    pvl->addWidget(body(tr("Permitted Uses:")));
+    pvl->addWidget(bullet(tr("Referring to Fincept products in editorial or descriptive contexts")));
+    pvl->addWidget(bullet(tr("Linking to official Fincept resources")));
+    pvl->addWidget(bullet(tr("Academic or research references")));
+
+    pvl->addSpacing(4);
+    pvl->addWidget(body(tr("Prohibited Uses:")));
+    pvl->addWidget(bullet(tr("Using Fincept marks to imply endorsement or affiliation")));
+    pvl->addWidget(bullet(tr("Modifying or altering any Fincept trademark")));
+    pvl->addWidget(bullet(tr("Using Fincept marks in domain names or product names")));
+    pvl->addWidget(bullet(tr("Creating confusingly similar marks")));
+
+    pvl->addWidget(heading("4", tr("COPYRIGHT NOTICE")));
+    pvl->addWidget(body(tr("Copyright 2024-2026 Fincept Corporation. All rights reserved.")));
+    pvl->addWidget(body(tr("This software is licensed under AGPL-3.0-or-later, and under no other licence. "
+                           "Fincept Terminal Enterprise is a separate closed-source product and is not "
+                           "covered by this licence.")));
+
+    pvl->addWidget(heading("5", tr("DATA PROVIDER ACKNOWLEDGMENTS")));
+    pvl->addWidget(bullet(tr("Market data provided by various exchanges and data vendors")));
+    pvl->addWidget(bullet(tr("Economic data from DBnomics, FRED, and government sources")));
+    pvl->addWidget(bullet(tr("News data from licensed news aggregation services")));
+    pvl->addWidget(bullet(tr("Geopolitical data from HDX and public sources")));
+    pvl->addWidget(bullet(tr("Crypto data from exchange APIs (Kraken, HyperLiquid, etc.)")));
+    // OpenStreetMap tiles carry a mandatory ODbL attribution requirement and the
+    // terminal renders them (QGeoView / maritime + relationship maps) — this was
+    // missing entirely.
+    pvl->addWidget(bullet(tr("Map data © OpenStreetMap contributors, available under the Open "
+                             "Database License (ODbL)")));
+
+    pvl->addWidget(heading("6", tr("THIRD-PARTY SOFTWARE")));
+    pvl->addWidget(body(tr("Fincept Terminal is built on the following open source components, "
+                           "used under their respective licenses:")));
+    // Component/license names are proper nouns — shown verbatim.
+    pvl->addWidget(bullet("Qt 6 — The Qt Company (LGPL-3.0)"));
+    pvl->addWidget(bullet("CPython 3.11 — Python Software Foundation (PSF License)"));
+    pvl->addWidget(bullet("QXlsx — QtExcel (MIT)"));
+    pvl->addWidget(bullet("QGeoView — AmonRaNet (LGPL-3.0)"));
+    pvl->addWidget(bullet("SQLite — public domain"));
+
+    pvl->addWidget(heading("7", tr("REPORTING INFRINGEMENT")));
+    pvl->addWidget(body(tr("To report trademark infringement, contact: support@fincept.in")));
+
+    pvl->addWidget(heading("8", tr("LEGAL DEPARTMENT")));
+    pvl->addWidget(body(tr("Fincept Corporation — Legal Department")));
+    pvl->addWidget(body(tr("Email: support@fincept.in")));
+
+    vl->addWidget(panel);
+    vl->addStretch();
+
+    return page;
+}
+
+} // namespace fincept::screens

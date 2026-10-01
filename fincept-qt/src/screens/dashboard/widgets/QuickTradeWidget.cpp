@@ -1,0 +1,385 @@
+#include "screens/dashboard/widgets/QuickTradeWidget.h"
+
+#include "datahub/DataHub.h"
+#include "datahub/DataHubMetaTypes.h"
+#include "ui/theme/Theme.h"
+
+#include <QFrame>
+#include <QHBoxLayout>
+#include <QMessageBox>
+
+namespace fincept::screens::widgets {
+
+static QString input_style(const QString& border_color = "") {
+    QString bc = border_color.isEmpty() ? ui::colors::BORDER_MED() : border_color;
+    return QString("QLineEdit { background: %1; color: %2; border: 1px solid %3; "
+                   "font-size: 11px; padding: 4px 6px; }"
+                   "QLineEdit:focus { border-color: %4; }")
+        .arg(ui::colors::BG_BASE())
+        .arg(ui::colors::TEXT_PRIMARY())
+        .arg(bc)
+        .arg(ui::colors::AMBER());
+}
+
+static QString combo_style() {
+    return QString("QComboBox { background: %1; color: %2; border: 1px solid %3; "
+                   "font-size: 11px; padding: 4px 6px; }"
+                   "QComboBox::drop-down { border: none; width: 16px; }"
+                   "QComboBox QAbstractItemView { background: %1; color: %2; border: 1px solid %3; }")
+        .arg(ui::colors::BG_BASE())
+        .arg(ui::colors::TEXT_PRIMARY())
+        .arg(ui::colors::BORDER_MED());
+}
+
+QuickTradeWidget::QuickTradeWidget(QWidget* parent) : BaseWidget(tr("QUICK TRADE"), parent, ui::colors::AMBER()) {
+    auto* vl = content_layout();
+    vl->setContentsMargins(10, 10, 10, 10);
+    vl->setSpacing(8);
+
+    // ── Symbol search bar ──
+    auto* search_row = new QWidget(this);
+    auto* srl = new QHBoxLayout(search_row);
+    srl->setContentsMargins(0, 0, 0, 0);
+    srl->setSpacing(6);
+
+    symbol_input_ = new QLineEdit;
+    symbol_input_->setPlaceholderText(tr("Symbol (e.g. AAPL)"));
+    symbol_input_->setText("AAPL");
+    srl->addWidget(symbol_input_, 1);
+
+    lookup_btn_ = new QPushButton(tr("LOOKUP"));
+    srl->addWidget(lookup_btn_);
+    vl->addWidget(search_row);
+
+    // ── Quote display ──
+    quote_card_ = new QWidget(this);
+    auto* qcl = new QHBoxLayout(quote_card_);
+    qcl->setContentsMargins(10, 8, 10, 8);
+    qcl->setSpacing(12);
+
+    auto* sym_col = new QVBoxLayout;
+    sym_label_ = new QLabel("--");
+    sym_col->addWidget(sym_label_);
+    change_label_ = new QLabel("--");
+    sym_col->addWidget(change_label_);
+    qcl->addLayout(sym_col);
+
+    qcl->addStretch();
+
+    auto* price_col = new QVBoxLayout;
+    price_col->setAlignment(Qt::AlignRight);
+    price_label_ = new QLabel("--");
+    price_label_->setAlignment(Qt::AlignRight);
+    price_col->addWidget(price_label_);
+
+    auto* bid_ask_row = new QHBoxLayout;
+    bid_label_ = new QLabel(tr("BID --"));
+    bid_ask_row->addWidget(bid_label_);
+    bid_ask_row->addSpacing(8);
+    ask_label_ = new QLabel(tr("ASK --"));
+    bid_ask_row->addWidget(ask_label_);
+    price_col->addLayout(bid_ask_row);
+    qcl->addLayout(price_col);
+
+    vl->addWidget(quote_card_);
+
+    // ── Separator ──
+    separator_ = new QFrame;
+    separator_->setFixedHeight(1);
+    vl->addWidget(separator_);
+
+    // ── Order form ──
+    // Side + Type row
+    auto* st_row = new QHBoxLayout;
+    st_row->setSpacing(6);
+
+    side_combo_ = new QComboBox;
+    side_combo_->addItems({tr("BUY"), tr("SELL"), tr("SHORT")});
+    st_row->addWidget(side_combo_, 1);
+
+    order_type_ = new QComboBox;
+    order_type_->addItems({tr("MARKET"), tr("LIMIT"), tr("STOP")});
+    st_row->addWidget(order_type_, 1);
+    vl->addLayout(st_row);
+
+    // Qty + Limit price row
+    auto* qp_row = new QHBoxLayout;
+    qp_row->setSpacing(6);
+
+    qty_lbl_ = new QLabel(tr("QTY"));
+    qp_row->addWidget(qty_lbl_);
+
+    qty_input_ = new QLineEdit("10");
+    qty_input_->setValidator(new QDoubleValidator(0, 1e9, 4, qty_input_));
+    qp_row->addWidget(qty_input_, 1);
+
+    price_lbl_ = new QLabel(tr("PRICE"));
+    qp_row->addWidget(price_lbl_);
+
+    price_input_ = new QLineEdit;
+    price_input_->setPlaceholderText(tr("market"));
+    qp_row->addWidget(price_input_, 1);
+    vl->addLayout(qp_row);
+
+    // Estimated total
+    est_total_ = new QLabel(tr("EST. TOTAL  --"));
+    vl->addWidget(est_total_);
+
+    // Submit button
+    submit_btn_ = new QPushButton(tr("PLACE ORDER"));
+    submit_btn_->setFixedHeight(32);
+    vl->addWidget(submit_btn_);
+
+    // ── Accessibility ──
+    symbol_input_->setAccessibleName(tr("Symbol"));
+    lookup_btn_->setAccessibleName(tr("Look up symbol"));
+    side_combo_->setAccessibleName(tr("Order side"));
+    order_type_->setAccessibleName(tr("Order type"));
+    qty_input_->setAccessibleName(tr("Quantity"));
+    price_input_->setAccessibleName(tr("Limit / stop price"));
+    submit_btn_->setAccessibleName(tr("Place order"));
+    setTabOrder(symbol_input_, lookup_btn_);
+    setTabOrder(lookup_btn_, side_combo_);
+    setTabOrder(side_combo_, order_type_);
+    setTabOrder(order_type_, qty_input_);
+    setTabOrder(qty_input_, price_input_);
+    setTabOrder(price_input_, submit_btn_);
+
+    // ── Connections ──
+    connect(lookup_btn_, &QPushButton::clicked, this, &QuickTradeWidget::lookup_symbol);
+    connect(symbol_input_, &QLineEdit::returnPressed, this, &QuickTradeWidget::lookup_symbol);
+    connect(side_combo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &QuickTradeWidget::on_side_changed);
+    connect(submit_btn_, &QPushButton::clicked, this, &QuickTradeWidget::submit_order);
+    connect(order_type_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int idx) {
+        price_input_->setEnabled(idx != 0); // disable for MARKET
+        price_input_->setPlaceholderText(idx == 0 ? tr("market") : QStringLiteral("0.00"));
+    });
+    connect(qty_input_, &QLineEdit::textChanged, this, [this](const QString&) {
+        if (current_price_ > 0) {
+            double qty = qty_input_->text().toDouble();
+            double total = qty * current_price_;
+            est_total_->setText(tr("EST. TOTAL  $%1").arg(total, 0, 'f', 2));
+        }
+    });
+    connect(this, &BaseWidget::refresh_requested, this, &QuickTradeWidget::lookup_symbol);
+
+    apply_styles();
+
+    // Initial lookup
+    set_loading(true);
+    // Hub path: initial lookup happens from showEvent.
+}
+
+void QuickTradeWidget::showEvent(QShowEvent* e) {
+    BaseWidget::showEvent(e);
+    if (!hub_active_)
+        lookup_symbol();
+}
+
+void QuickTradeWidget::hideEvent(QHideEvent* e) {
+    BaseWidget::hideEvent(e);
+    if (hub_active_)
+        hub_unsubscribe_all();
+}
+
+void QuickTradeWidget::apply_styles() {
+    symbol_input_->setStyleSheet(input_style());
+    lookup_btn_->setStyleSheet(QString("QPushButton { background: %1; color: %2; border: 1px solid %3; "
+                                       "font-size: 10px; font-weight: bold; padding: 4px 10px; }"
+                                       "QPushButton:hover { background: %4; }")
+                                   .arg(ui::colors::BG_RAISED())
+                                   .arg(ui::colors::AMBER())
+                                   .arg(ui::colors::AMBER())
+                                   .arg(ui::colors::BG_HOVER()));
+
+    quote_card_->setStyleSheet(QString("background: %1; border-radius: 2px;").arg(ui::colors::BG_RAISED()));
+    sym_label_->setStyleSheet(QString("color: %1; font-size: 14px; font-weight: bold; background: transparent;")
+                                  .arg(ui::colors::TEXT_PRIMARY()));
+    change_label_->setStyleSheet(
+        QString("color: %1; font-size: 10px; background: transparent;").arg(ui::colors::TEXT_TERTIARY()));
+    price_label_->setStyleSheet(QString("color: %1; font-size: 20px; font-weight: bold; background: transparent;")
+                                    .arg(ui::colors::TEXT_PRIMARY()));
+    bid_label_->setStyleSheet(
+        QString("color: %1; font-size: 9px; background: transparent;").arg(ui::colors::POSITIVE()));
+    ask_label_->setStyleSheet(
+        QString("color: %1; font-size: 9px; background: transparent;").arg(ui::colors::NEGATIVE()));
+
+    separator_->setStyleSheet(QString("background: %1;").arg(ui::colors::BORDER_DIM()));
+
+    side_combo_->setStyleSheet(combo_style());
+    order_type_->setStyleSheet(combo_style());
+
+    qty_lbl_->setStyleSheet(
+        QString("color: %1; font-size: 9px; background: transparent;").arg(ui::colors::TEXT_TERTIARY()));
+    qty_input_->setStyleSheet(input_style());
+    price_lbl_->setStyleSheet(
+        QString("color: %1; font-size: 9px; background: transparent;").arg(ui::colors::TEXT_TERTIARY()));
+    price_input_->setStyleSheet(input_style(ui::colors::BORDER_DIM()));
+
+    est_total_->setStyleSheet(
+        QString("color: %1; font-size: 10px; background: transparent;").arg(ui::colors::TEXT_SECONDARY()));
+
+    // Submit button color depends on current side selection
+    on_side_changed(side_combo_->currentIndex());
+}
+
+void QuickTradeWidget::on_theme_changed() {
+    apply_styles();
+}
+
+void QuickTradeWidget::lookup_symbol() {
+    QString sym = symbol_input_->text().trimmed().toUpper();
+    if (sym.isEmpty()) {
+        set_loading(false);
+        return;
+    }
+
+    current_symbol_ = sym;
+    auto& hub = datahub::DataHub::instance();
+    // Swap subscription to the new symbol; drop the old one first.
+    hub.unsubscribe(this);
+    const QString topic = QStringLiteral("market:quote:") + sym;
+    hub.subscribe(this, topic, [this](const QVariant& v) {
+        if (!v.canConvert<services::QuoteData>())
+            return;
+        set_loading(false);
+        apply_quote(v.value<services::QuoteData>());
+    });
+    // Kick a fresh fetch so the card updates immediately even if the
+    // cached TTL hasn't expired.
+    hub.request(topic);
+    hub_active_ = true;
+    set_loading(true);
+}
+
+void QuickTradeWidget::apply_quote(const services::QuoteData& q) {
+    current_price_ = q.price;
+    current_symbol_ = q.symbol.isEmpty() ? current_symbol_ : q.symbol;
+
+    sym_label_->setText(current_symbol_);
+    price_label_->setText(QString("$%1").arg(q.price, 0, 'f', 2));
+
+    double chg = q.change_pct;
+    QString chg_str = QString("%1%2%").arg(chg >= 0 ? "▲ +" : "▼ ").arg(chg, 0, 'f', 2);
+    QString chg_col = chg > 0   ? ui::colors::POSITIVE()
+                      : chg < 0 ? ui::colors::NEGATIVE()
+                                : ui::colors::TEXT_SECONDARY();
+    change_label_->setText(chg_str);
+    change_label_->setStyleSheet(QString("color: %1; font-size: 10px; background: transparent;").arg(chg_col));
+
+    // QuoteData from yfinance has no bid/ask — show em-dashes rather than
+    // a fabricated spread (the previous price*0.0005 placeholder was
+    // misleading on a trade-entry widget). Real bid/ask must come from a
+    // broker quote stream (`broker:<id>:<account>:quote:<sym>`) which the
+    // user wires up via the gear-icon config — wiring deferred.
+    bid_label_->setText(tr("BID  —"));
+    ask_label_->setText(tr("ASK  —"));
+
+    double qty = qty_input_->text().toDouble();
+    if (qty > 0)
+        est_total_->setText(tr("EST. TOTAL  $%1").arg(qty * q.price, 0, 'f', 2));
+}
+
+void QuickTradeWidget::hub_unsubscribe_all() {
+    datahub::DataHub::instance().unsubscribe(this);
+    hub_active_ = false;
+}
+
+void QuickTradeWidget::on_side_changed(int idx) {
+    // BUY = green, SELL/SHORT = red
+    QString color = (idx == 0) ? ui::colors::POSITIVE() : ui::colors::NEGATIVE();
+    submit_btn_->setText(idx == 0   ? tr("PLACE BUY ORDER")
+                         : idx == 1 ? tr("PLACE SELL ORDER")
+                                    : tr("PLACE SHORT ORDER"));
+    submit_btn_->setStyleSheet(QString("QPushButton { background: %1; color: %3; border: none; "
+                                       "font-size: 11px; font-weight: bold; }"
+                                       "QPushButton:hover { background: %2; }")
+                                   .arg(color, color, ui::colors::TEXT_PRIMARY()));
+}
+
+void QuickTradeWidget::submit_order() {
+    QString sym = current_symbol_.isEmpty() ? symbol_input_->text().trimmed().toUpper() : current_symbol_;
+    double qty = qty_input_->text().toDouble();
+    QString side = side_combo_->currentText();
+
+    if (sym.isEmpty() || qty <= 0) {
+        QMessageBox::warning(this, tr("Quick Trade"), tr("Please enter a valid symbol and quantity."));
+        return;
+    }
+
+    // NOTE: the removed `price_str` local compared `order_type_->currentText()`
+    // against the literal "MARKET" — a translated string, so the branch was
+    // wrong in every non-English locale. It was also immediately Q_UNUSED'd.
+    //
+    // This dashboard widget has no broker/account binding, so it cannot place a
+    // real or paper order. Previously it popped an "Order sent to trading
+    // engine" success box while sending nothing — a dangerous false confirmation
+    // on a trading terminal. Be honest and point the user at the real order
+    // entry (Equity/Crypto Trading), which has account selection, paper/live
+    // routing and an explicit confirmation. (Wiring Quick Trade to an account is
+    // tracked as a follow-up.)
+    // The dialog now offers a one-click hand-off: "Open Equity Trading" selects
+    // this symbol there via nav.open_symbol. That is navigation only - it never
+    // creates or sends an order; the order is still entered and confirmed on
+    // the trading screen.
+    QMessageBox box(QMessageBox::Information, tr("Quick Trade"),
+                    tr("Quick Trade is a preview widget and is not connected to a trading account — no order was "
+                       "placed.\n\n"
+                       "To place %1 %2 %3, use the Equity Trading or Crypto Trading screen, which routes the order to "
+                       "your selected broker/paper account with confirmation.")
+                        .arg(side)
+                        .arg(qty, 0, 'f', 0)
+                        .arg(sym),
+                    QMessageBox::NoButton, this);
+    QPushButton* open_btn = box.addButton(tr("Open Equity Trading"), QMessageBox::AcceptRole);
+    box.addButton(QMessageBox::Close);
+    box.setDefaultButton(QMessageBox::Close);
+    box.exec();
+    if (box.clickedButton() == open_btn)
+        open_symbol(sym, QStringLiteral("equity_trading"));
+}
+
+void QuickTradeWidget::retranslateUi() {
+    BaseWidget::retranslateUi();
+    set_title(tr("QUICK TRADE"));
+    if (lookup_btn_)
+        lookup_btn_->setText(tr("LOOKUP"));
+    if (qty_lbl_)
+        qty_lbl_->setText(tr("QTY"));
+    if (price_lbl_)
+        price_lbl_->setText(tr("PRICE"));
+    if (symbol_input_)
+        symbol_input_->setPlaceholderText(tr("Symbol (e.g. AAPL)"));
+    // Combo items and the bid/ask/total labels were previously left in the old
+    // language after a live switch.
+    if (order_type_) {
+        const int cur = order_type_->currentIndex();
+        const QStringList items = {tr("MARKET"), tr("LIMIT"), tr("STOP")};
+        for (int i = 0; i < order_type_->count() && i < items.size(); ++i)
+            order_type_->setItemText(i, items[i]);
+        order_type_->setCurrentIndex(cur);
+        if (price_input_)
+            price_input_->setPlaceholderText(cur == 0 ? tr("market") : QStringLiteral("0.00"));
+    }
+    if (side_combo_) {
+        const int cur = side_combo_->currentIndex();
+        const QStringList items = {tr("BUY"), tr("SELL"), tr("SHORT")};
+        for (int i = 0; i < side_combo_->count() && i < items.size(); ++i)
+            side_combo_->setItemText(i, items[i]);
+        side_combo_->setCurrentIndex(cur);
+    }
+    if (bid_label_)
+        bid_label_->setText(current_price_ > 0 ? tr("BID  —") : tr("BID --"));
+    if (ask_label_)
+        ask_label_->setText(current_price_ > 0 ? tr("ASK  —") : tr("ASK --"));
+    if (est_total_) {
+        const double qty = qty_input_ ? qty_input_->text().toDouble() : 0.0;
+        est_total_->setText(current_price_ > 0 && qty > 0 ? tr("EST. TOTAL  $%1").arg(qty * current_price_, 0, 'f', 2)
+                                                          : tr("EST. TOTAL  --"));
+    }
+    // submit_btn_ text is side-aware ("PLACE BUY ORDER" etc.) — let on_side_changed re-derive it.
+    if (side_combo_)
+        on_side_changed(side_combo_->currentIndex());
+}
+
+} // namespace fincept::screens::widgets

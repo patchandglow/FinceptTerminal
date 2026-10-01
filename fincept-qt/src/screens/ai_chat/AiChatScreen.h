@@ -1,0 +1,223 @@
+#pragma once
+
+#include "core/events/EventBus.h"
+#include "core/symbol/IGroupLinked.h"
+#include "core/symbol/SymbolGroup.h"
+#include "core/symbol/SymbolRef.h"
+#include "screens/common/IStatefulScreen.h"
+#include "services/llm/LlmService.h"
+
+#include <QLabel>
+#include <QLineEdit>
+#include <QList>
+#include <QListWidget>
+#include <QMutex>
+#include <QPlainTextEdit>
+#include <QPointer>
+#include <QPropertyAnimation>
+#include <QPushButton>
+#include <QScrollArea>
+#include <QStringList>
+#include <QTimer>
+#include <QVBoxLayout>
+#include <QWidget>
+
+#include <vector>
+
+namespace fincept::screens {
+
+class AiChatScreen : public QWidget, public IStatefulScreen, public fincept::IGroupLinked {
+    Q_OBJECT
+    Q_INTERFACES(fincept::IGroupLinked)
+  public:
+    explicit AiChatScreen(QWidget* parent = nullptr);
+
+    void restore_state(const QVariantMap& state) override;
+    QVariantMap save_state() const override;
+    QString state_key() const override { return "ai_chat"; }
+    // v2 adds: draft text, search text, scroll position, attached file path.
+    // v3 adds: sidebar_collapsed.
+    int state_version() const override { return 3; }
+
+    // IGroupLinked — Phase 7: AI Chat is a consumer-only participant. When a
+    // panel in the same group selects a symbol, the chat input gets a
+    // gentle "Context: <SYMBOL>" prefix appended (visible to the user) so
+    // their next prompt has the security in scope. Chat itself never
+    // publishes — the symbol leaving here would not match any meaningful
+    // user intent (the user typed a question, not a ticker selection).
+    void set_group(fincept::SymbolGroup g) override;
+    fincept::SymbolGroup group() const override { return link_group_; }
+    void on_group_symbol_changed(const fincept::SymbolRef& ref) override;
+    fincept::SymbolRef current_symbol() const override { return linked_symbol_; }
+
+  protected:
+    void showEvent(QShowEvent* e) override;
+    void hideEvent(QHideEvent* e) override;
+    bool eventFilter(QObject* obj, QEvent* event) override;
+    void resizeEvent(QResizeEvent* e) override;
+    void changeEvent(QEvent* event) override;
+
+  private slots:
+    void on_send();
+    void on_attach_file();
+    void on_new_session();
+    void on_session_selected(int row);
+    void on_delete_session();
+    void on_rename_session();
+    void on_stream_chunk(const QString& chunk, bool done);
+    void on_streaming_done(ai_chat::LlmResponse response);
+    void on_provider_changed();
+    void on_search_changed(const QString& text);
+    void on_typing_indicator_tick();
+    void on_toggle_sidebar();
+
+  private:
+    // ── Sidebar ──────────────────────────────────────────────────────────
+    QWidget* sidebar_ = nullptr;
+    QLineEdit* search_edit_ = nullptr;
+    QListWidget* session_list_ = nullptr;
+    QPushButton* new_btn_ = nullptr;
+    QPushButton* delete_btn_ = nullptr;
+    QPushButton* rename_btn_ = nullptr;
+    QLabel* provider_lbl_ = nullptr;
+    QLabel* model_lbl_ = nullptr;
+
+    // ── Sidebar collapse state ───────────────────────────────────────────
+    QPushButton* sidebar_toggle_btn_ = nullptr;
+    QPropertyAnimation* sidebar_anim_ = nullptr;
+    bool sidebar_collapsed_ = false;
+    static constexpr int kSidebarExpandedWidth = 280;
+    void apply_sidebar_collapsed(bool collapsed, bool animate);
+
+    // ── Chat header ──────────────────────────────────────────────────────
+    QWidget* chat_widget_ = nullptr;
+    QLabel* hdr_status_dot_ = nullptr;
+    QLabel* hdr_status_lbl_ = nullptr;
+    QLabel* hdr_session_lbl_ = nullptr;
+    QLabel* hdr_model_lbl_ = nullptr;
+    QLabel* hdr_tokens_lbl_ = nullptr;
+
+    // ── Chat area ────────────────────────────────────────────────────────
+    QScrollArea* scroll_area_ = nullptr;
+    QWidget* messages_container_ = nullptr;
+    QVBoxLayout* messages_layout_ = nullptr;
+    QWidget* welcome_panel_ = nullptr;
+    QPlainTextEdit* input_box_ = nullptr;
+    QPushButton* send_btn_ = nullptr;
+    QPushButton* attach_btn_ = nullptr;
+    QLabel* attach_badge_ = nullptr; // shows attached file name
+    QString attached_file_path_;
+
+    // ── Typing indicator ─────────────────────────────────────────────────
+    QWidget* typing_indicator_ = nullptr;
+    QLabel* typing_dots_lbl_ = nullptr;
+    QTimer* typing_timer_ = nullptr;
+    int typing_step_ = 0;
+
+    // ── State ────────────────────────────────────────────────────────────
+    QString active_session_id_;
+    // Snapshot of request‑time context – used by the async response handler
+    QString pending_req_session_;
+    QString pending_req_provider_;
+    QString pending_req_model_;
+    QString active_session_title_;
+    mutable QMutex history_mutex_;
+    std::vector<ai_chat::ConversationMessage> history_;
+    bool streaming_ = false;
+    // True while the in-flight request is a streamed one that cancel_active_request()
+    // can interrupt; makes the send button double as "Stop" (see set_input_enabled).
+    bool stoppable_ = false;
+    bool scroll_pending_ = false;
+    // Auto-follow the newest content. Cleared when the user scrolls up to read,
+    // re-armed when they come back to the bottom or send a new message.
+    bool stick_to_bottom_ = true;
+    // Set around our own setValue() calls so the valueChanged handler doesn't
+    // mistake an auto-scroll for the user scrolling.
+    bool programmatic_scroll_ = false;
+    QPointer<QLabel> streaming_bubble_;
+    int total_tokens_ = 0;
+    int total_messages_ = 0;
+
+    // ── Per-stream "Thinking" (chain-of-thought) section ─────────────────────
+    // Reasoning models stream their thoughts on a separate channel (see
+    // think_stream_prefix()). We collect them into a collapsible card inserted
+    // ABOVE the answer bubble so the answer stays clean. Reset between messages.
+    QPointer<QWidget> thinking_card_;
+    QPointer<QPushButton> thinking_header_;
+    QPointer<QLabel> thinking_body_;
+    QString thinking_text_;
+
+    // ── Per-stream "Tools" section ───────────────────────────────────────────
+    // Tool-progress lines arrive on their own channel (see tool_stream_prefix())
+    // and land in a card of their own rather than being appended into the answer
+    // bubble — plumbing like tool_list / tool_describe is not part of the reply.
+    // Expanded while running so the user can see progress, collapsed on finish.
+    QPointer<QWidget> tools_card_;
+    QPointer<QPushButton> tools_header_;
+    QPointer<QLabel> tools_body_;
+    QString tools_text_;
+    QStringList tools_lines_;  // rendered lines; last one is rewritten to collapse runs
+    QString tools_run_base_;   // tool name of the run currently being collapsed
+    int tools_run_count_ = 0;  // length of that run
+    int tools_count_ = 0;      // total steps, for the collapsed header
+
+    // ── Build ────────────────────────────────────────────────────────────
+    void build_ui();
+    void retranslateUi();
+    void build_sidebar();
+    void build_chat_area();
+    QWidget* build_header_bar();
+    QWidget* build_welcome();
+    QWidget* build_input_area();
+    QWidget* build_typing_indicator();
+    void refresh_theme();
+
+    // ── Data ─────────────────────────────────────────────────────────────
+    void load_sessions();
+    void load_messages(const QString& session_id);
+    void create_new_session();
+    void add_message_bubble(const QString& role, const QString& content, const QString& timestamp = {});
+    QLabel* add_streaming_bubble();
+    // Collapsible "Thinking" card for the in-flight assistant message.
+    void append_thinking_chunk(const QString& text);
+    void create_thinking_card();
+    void finalize_thinking_card();
+    void reset_thinking_state();
+    // Collapsible "Tools" card for the in-flight assistant message.
+    void append_tool_chunk(const QString& text);
+    void create_tools_card();
+    void finalize_tools_card();
+    void reset_tools_state();
+    void clear_messages();
+    void scroll_to_bottom();
+    void set_input_enabled(bool enabled);
+    void update_stats();
+    void show_welcome(bool show);
+    void show_typing(bool show);
+
+    // EventBus subscriptions — registered in showEvent, released in hideEvent.
+    // MCP set_active_llm publishes llm.provider_changed when the LLM (or
+    // Finagent) switches the active provider. We force-reload LlmService so
+    // the next message uses the new provider; LlmService::config_changed
+    // signal then triggers on_provider_changed for header refresh.
+    QList<EventBus::HandlerId> mcp_event_subs_;
+    void subscribe_mcp_events();
+    void unsubscribe_mcp_events();
+
+    // Phase 7 linking. SymbolGroup::None when unlinked.
+    fincept::SymbolGroup link_group_ = fincept::SymbolGroup::None;
+    // Last symbol received from the linked group. Saved as the screen's
+    // "current_symbol" so the link badge reflects the most recent context.
+    // Used to prefix the next user-sent message with "[Context: <SYMBOL>]"
+    // so the LLM has the security in scope without the user having to type
+    // it. Consumed (one-shot) on send; the linked symbol persists so the
+    // badge keeps showing until the group changes.
+    fincept::SymbolRef linked_symbol_;
+    // True from the moment a linked symbol arrives until the next message is sent. The
+    // doc above promises the "[Context: …]" prefix is one-shot, but nothing ever
+    // consumed it: linked_symbol_ persists (for the badge), so EVERY later message kept
+    // being tagged with a symbol the conversation had long moved on from.
+    bool linked_context_pending_ = false;
+};
+
+} // namespace fincept::screens

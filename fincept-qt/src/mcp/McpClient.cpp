@@ -1,0 +1,423 @@
+// McpClient.cpp — JSON-RPC 2.0 over stdio for external MCP servers (Qt port)
+
+#include "mcp/McpClient.h"
+
+#include "core/logging/Logger.h"
+#include "python/PythonSetupManager.h"
+
+#include <QCoreApplication>
+#include <QElapsedTimer>
+#include <QFileInfo>
+#include <QJsonDocument>
+#include <QMetaObject>
+#include <QProcessEnvironment>
+#include <QThread>
+
+namespace fincept::mcp {
+
+static constexpr const char* TAG = "McpClient";
+
+McpClient::McpClient(const McpServerConfig& config, QObject* parent) : QObject(parent), config_(config) {}
+
+McpClient::~McpClient() {
+    stop();
+}
+
+// ============================================================================
+// Lifecycle
+// ============================================================================
+
+Result<void> McpClient::start() {
+    // Invariant (also documented on McpClient.h:start and at the
+    // BlockingQueuedConnection below): never the UI thread. This blocks for up
+    // to 60 s in waitForStarted, and initialize() straight after adds another
+    // 120 s of blocking JSON-RPC. Q_ASSERT compiles out in release builds, so
+    // log it too — a violation is a UI freeze, not a crash, and freezes get
+    // misattributed for weeks.
+    Q_ASSERT(QThread::currentThread() != qApp->thread());
+    if (qApp && QThread::currentThread() == qApp->thread()) {
+        LOG_ERROR(TAG, "McpClient::start() called on the UI thread — this blocks for up to 180 s. "
+                       "Wrap the caller in QtConcurrent::run.");
+    }
+
+    if (running_)
+        return Result<void>::ok();
+
+    // Create a dedicated worker thread with its own event loop so that
+    // QProcess signals are delivered there. start() is always called from a
+    // background thread (never the UI thread), so blocking here is safe.
+    worker_thread_ = new QThread;
+    worker_thread_->setObjectName("mcp-" + config_.id);
+
+    process_ = new QProcess; // no parent — we'll move it to worker thread
+
+    // Merge environment
+    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+    for (auto it = config_.env.constBegin(); it != config_.env.constEnd(); ++it)
+        env.insert(it.key(), it.value());
+    process_->setProcessEnvironment(env);
+
+    // Wire signals — they'll fire on worker_thread_ once process_ is moved
+    connect(process_, &QProcess::readyReadStandardOutput, this, &McpClient::on_ready_read, Qt::DirectConnection);
+    connect(
+        process_, &QProcess::readyReadStandardError, this,
+        [this]() {
+            // Read the STDERR channel explicitly. canReadLine()/readLine() operate on
+            // the *current* read channel (stdout by default), so the old code drained
+            // stdout — dropping server error logs and, worse, stealing buffered
+            // JSON-RPC response lines (which then hung the request for the full timeout).
+            if (!process_)
+                return;
+            const QByteArray chunk = process_->readAllStandardError();
+            for (const QByteArray& raw : chunk.split('\n')) {
+                const QString line = QString::fromUtf8(raw).trimmed();
+                if (!line.isEmpty())
+                    append_log("[stderr] " + line);
+            }
+        },
+        Qt::DirectConnection);
+    connect(process_, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this, &McpClient::on_finished,
+            Qt::DirectConnection);
+
+    // Route uvx through the app's bundled uv
+    QString command = config_.command;
+    QStringList args = config_.args;
+    if (command == "uvx") {
+        const QString uv = python::PythonSetupManager::instance().uv_path();
+        if (QFileInfo::exists(uv)) {
+            command = uv;
+            args.prepend("run");
+            args.prepend("tool"); // becomes: uv tool run <package> <args>
+            LOG_INFO(TAG, "Routing uvx through bundled uv: " + uv);
+        }
+    }
+
+#ifdef _WIN32
+    process_->setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments* cpa) {
+        cpa->flags |= 0x08000000; // CREATE_NO_WINDOW
+    });
+#endif
+
+    // Move QProcess to worker thread and start it there
+    process_->moveToThread(worker_thread_);
+    worker_thread_->start();
+
+    // BlockingQueuedConnection is safe here — start() is always called from a
+    // background thread (McpService auto-start thread), never from the UI thread.
+    bool started_ok = false;
+    QMetaObject::invokeMethod(
+        process_,
+        [this, command, args, &started_ok]() {
+            process_->start(command, args);
+            started_ok = process_->waitForStarted(60000); // 60s for first-time uv downloads
+        },
+        Qt::BlockingQueuedConnection);
+
+    if (!started_ok) {
+        const QString err = process_->errorString();
+        LOG_ERROR(TAG, "Failed to start MCP server: " + config_.name + " — " + err);
+        worker_thread_->quit();
+        worker_thread_->wait(3000);
+        cleanup_process();
+        delete worker_thread_;
+        worker_thread_ = nullptr;
+        return Result<void>::err("Failed to start: " + config_.name.toStdString() + " — " + err.toStdString());
+    }
+
+    running_ = true;
+    LOG_INFO(TAG, "Started MCP server process: " + config_.name);
+    return Result<void>::ok();
+}
+
+void McpClient::cleanup_process() {
+    if (process_) {
+        delete process_;
+        process_ = nullptr;
+    }
+}
+
+void McpClient::stop() {
+    // Teardown is UNCONDITIONAL. The old `if (!running_) return;` guard looked
+    // like an idempotency check but was a resource leak: on_finished() sets
+    // running_ = false the moment the child process dies, so a stop() after a
+    // crash returned immediately and orphaned a parentless QThread still
+    // spinning an event loop plus its QProcess. McpManager restarts dead
+    // servers and resets the attempt budget on every success, so that leaked
+    // pair accumulated without bound. Only the terminate() is conditional now.
+    const bool was_running = running_.exchange(false);
+
+    // Wake any pending requests with an error
+    {
+        QMutexLocker lock(&rpc_mutex_);
+        for (auto* req : pending_) {
+            req->error = "Server stopped";
+            req->completed = true;
+        }
+        rpc_cond_.wakeAll();
+    }
+
+    // Kill and delete the QProcess ON ITS OWN THREAD. The old code called
+    // process_->kill() from the caller's thread (a cross-thread QProcess
+    // access) and then `delete worker_thread_` BEFORE cleanup_process()
+    // deleted process_ — destroying a QObject whose thread affinity pointed at
+    // an already-freed QThread. Modelled on trading/ExchangeSession::stop_ws.
+    const bool worker_alive =
+        worker_thread_ && worker_thread_->isRunning() && QThread::currentThread() != worker_thread_;
+    if (process_ && worker_alive) {
+        QMetaObject::invokeMethod(
+            process_,
+            [this, was_running]() {
+                if (!process_)
+                    return;
+                if (process_->state() != QProcess::NotRunning) {
+                    if (was_running)
+                        process_->terminate();
+                    if (!process_->waitForFinished(2000)) {
+                        process_->kill();
+                        process_->waitForFinished(1000);
+                    }
+                }
+                delete process_;
+                process_ = nullptr;
+            },
+            Qt::BlockingQueuedConnection);
+    }
+
+    if (worker_thread_) {
+        worker_thread_->quit();
+        if (worker_thread_->wait(3000)) {
+            delete worker_thread_;
+        } else {
+            // Deleting a still-running QThread is a crash, not a leak. The
+            // process is already gone by here, so a stuck event loop is a bug
+            // worth logging and leaking rather than aborting on during teardown.
+            LOG_ERROR(TAG, "Worker thread for " + config_.name + " did not exit — leaking it instead of crashing");
+        }
+        worker_thread_ = nullptr;
+    }
+
+    // No-op when the lambda above already deleted it; covers the paths where
+    // the worker thread was never started or had already exited (in which case
+    // there is no other thread with an affinity claim on process_).
+    cleanup_process();
+
+    if (was_running)
+        LOG_INFO(TAG, "Stopped MCP server: " + config_.name);
+}
+
+bool McpClient::is_running() const {
+    return running_ && process_ && process_->state() == QProcess::Running;
+}
+
+// ============================================================================
+// MCP Protocol Methods
+// ============================================================================
+
+Result<QJsonObject> McpClient::initialize() {
+    QJsonObject params;
+    params["protocolVersion"] = "2024-11-05";
+
+    QJsonObject client_info;
+    client_info["name"] = "FinceptTerminal";
+    client_info["version"] = FINCEPT_VERSION_STRING;
+    params["clientInfo"] = client_info;
+
+    QJsonObject capabilities;
+    params["capabilities"] = capabilities;
+
+    auto result = send_request("initialize", params, 120000); // 120s for slow servers
+    if (result.is_ok()) {
+        // Per the MCP spec the client MUST send an `initialized` notification after the
+        // initialize response. Spec-compliant servers (e.g. the official Python SDK)
+        // reject `tools/list` with "Received request before initialization was complete"
+        // and expose zero tools until they receive it.
+        send_notification("notifications/initialized", {});
+    }
+    return result;
+}
+
+void McpClient::send_notification(const QString& method, const QJsonObject& params) {
+    if (!is_running())
+        return;
+    // JSON-RPC 2.0 notification: same frame as a request but with NO "id" and no reply.
+    QJsonObject note;
+    note["jsonrpc"] = "2.0";
+    note["method"] = method;
+    if (!params.isEmpty())
+        note["params"] = params;
+    const QByteArray line = QJsonDocument(note).toJson(QJsonDocument::Compact) + "\n";
+    QMetaObject::invokeMethod(
+        process_,
+        [this, line]() {
+            if (process_)
+                process_->write(line);
+        },
+        Qt::QueuedConnection);
+    LOG_INFO(TAG, "RPC → " + method + " (notification)");
+}
+
+Result<std::vector<ExternalTool>> McpClient::list_tools() {
+    auto result = send_request("tools/list", {});
+    if (result.is_err())
+        return Result<std::vector<ExternalTool>>::err(result.error());
+
+    const QJsonObject& data = result.value();
+    QJsonArray tools_json = data["tools"].toArray();
+
+    std::vector<ExternalTool> tools;
+    tools.reserve(static_cast<std::size_t>(tools_json.size()));
+
+    for (const auto& item : tools_json) {
+        QJsonObject t = item.toObject();
+        ExternalTool et;
+        et.server_id = config_.id;
+        et.server_name = config_.name;
+        et.name = t["name"].toString();
+        et.description = t["description"].toString();
+        et.input_schema = t["inputSchema"].toObject();
+        tools.push_back(std::move(et));
+    }
+
+    return Result<std::vector<ExternalTool>>::ok(std::move(tools));
+}
+
+Result<QJsonObject> McpClient::call_tool(const QString& name, const QJsonObject& args) {
+    QJsonObject params;
+    params["name"] = name;
+    params["arguments"] = args;
+    // 120s timeout for tool execution — external tools like database queries
+    // (Postgres, MySQL, etc.) can take significantly longer than 30s,
+    // especially for schema introspection or large result sets.
+    return send_request("tools/call", params, 120000);
+}
+
+Result<void> McpClient::ping() {
+    auto r = send_request("ping", {}, 5000);
+    if (r.is_err())
+        return Result<void>::err(r.error());
+    return Result<void>::ok();
+}
+
+// ============================================================================
+// JSON-RPC internals
+// ============================================================================
+
+Result<QJsonObject> McpClient::send_request(const QString& method, const QJsonObject& params, int timeout_ms) {
+    if (!is_running())
+        return Result<QJsonObject>::err("Server not running: " + config_.name.toStdString());
+
+    int id;
+    PendingRequest pending;
+
+    {
+        QMutexLocker lock(&rpc_mutex_);
+        id = next_id_++;
+        pending_[id] = &pending;
+    }
+
+    // Build JSON-RPC 2.0 request
+    QJsonObject req;
+    req["jsonrpc"] = "2.0";
+    req["id"] = id;
+    req["method"] = method;
+    if (!params.isEmpty())
+        req["params"] = params;
+
+    LOG_INFO(TAG, "RPC → " + method + " (id=" + QString::number(id) + ")");
+
+    QByteArray line = QJsonDocument(req).toJson(QJsonDocument::Compact) + "\n";
+
+    // Write to process on its worker thread
+    QMetaObject::invokeMethod(process_, [this, line]() { process_->write(line); }, Qt::QueuedConnection);
+
+    // Wait for response via QWaitCondition. QProcess lives on its own
+    // worker thread with an event loop, so readyRead signals fire there
+    // and handle_line() wakes us up via rpc_cond_.
+    QElapsedTimer timer;
+    timer.start();
+
+    {
+        QMutexLocker lock(&rpc_mutex_);
+        if (!pending.completed) {
+            rpc_cond_.wait(&rpc_mutex_, static_cast<unsigned long>(timeout_ms));
+        }
+    }
+
+    {
+        QMutexLocker lock(&rpc_mutex_);
+        pending_.remove(id);
+    }
+
+    if (!pending.error.isEmpty())
+        return Result<QJsonObject>::err(pending.error.toStdString());
+    if (!pending.completed)
+        return Result<QJsonObject>::err("Timeout waiting for: " + method.toStdString());
+
+    LOG_INFO(TAG, "RPC ← " + method + " OK (" + QString::number(timer.elapsed()) + "ms)");
+    return Result<QJsonObject>::ok(pending.response);
+}
+
+void McpClient::handle_line(const QByteArray& line) {
+    if (line.trimmed().isEmpty())
+        return;
+
+    QJsonDocument doc = QJsonDocument::fromJson(line);
+    if (!doc.isObject())
+        return;
+
+    QJsonObject obj = doc.object();
+    if (!obj.contains("id"))
+        return; // Notification — ignored for now
+
+    int id = obj["id"].toInt(-1);
+    if (id < 0)
+        return;
+
+    QMutexLocker lock(&rpc_mutex_);
+    PendingRequest* req = pending_.value(id, nullptr);
+    if (!req)
+        return;
+
+    if (obj.contains("error")) {
+        req->error = obj["error"].toObject()["message"].toString("RPC error");
+    } else {
+        req->response = obj["result"].toObject();
+    }
+    req->completed = true;
+    rpc_cond_.wakeAll();
+}
+
+void McpClient::on_ready_read() {
+    while (process_ && process_->canReadLine()) {
+        QByteArray line = process_->readLine();
+        append_log("[stdout] " + QString::fromUtf8(line).trimmed());
+        handle_line(line);
+    }
+}
+
+QStringList McpClient::get_logs() const {
+    QMutexLocker lock(&log_mutex_);
+    return log_lines_;
+}
+
+void McpClient::append_log(const QString& line) {
+    QMutexLocker lock(&log_mutex_);
+    log_lines_.append(line);
+    if (log_lines_.size() > MAX_LOG_LINES)
+        log_lines_.removeFirst();
+}
+
+void McpClient::on_finished(int exit_code, QProcess::ExitStatus) {
+    running_ = false;
+    LOG_WARN(TAG, QString("MCP server '%1' exited with code %2").arg(config_.name).arg(exit_code));
+
+    // Wake pending requests
+    QMutexLocker lock(&rpc_mutex_);
+    for (auto* req : pending_) {
+        req->error = "Server process exited";
+        req->completed = true;
+    }
+    rpc_cond_.wakeAll();
+}
+
+} // namespace fincept::mcp

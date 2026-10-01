@@ -1,0 +1,85 @@
+#pragma once
+// SectorResolver.h — Singleton that maps symbols to sector labels.
+//
+// Resolution order per symbol:
+//   1. In-memory cache (populated from `sector_cache` SQLite table at startup).
+//   2. Explicit override passed via remember().
+//   3. yfinance `info` lookup through MarketDataService. We retry with a `.TO`
+//      suffix for Canadian TSX symbols that didn't resolve bare.
+//   4. Persistent fallback "Unclassified".
+//
+// Negative hits — yfinance ANSWERED but the instrument genuinely has no sector
+// (mutual funds, cash, obscure ETFs) — are cached with an explicit `negative`
+// flag and a 7-day TTL, checked both at load and on every sector_for() hit.
+//
+// A FETCH FAILURE is not a negative hit and is never cached. Previously the
+// completion path ran on success and failure alike, so a transient script/
+// network error was persisted as if it were data: the symbol resolved to
+// "Unclassified" (or "Cash" for TDB* codes) and, because the TTL was only
+// consulted at construction and only matched the literal string
+// "Unclassified", the wrong answer survived for the whole session and — for
+// the "Cash" case — forever.
+//
+// The resolver is sync-for-cache-hits and async-for-misses. Consumers should
+// either:
+//   - call sector_for() (returns empty for unknowns, triggers async fetch)
+//   - subscribe to sector_resolved() to be notified when the fetch lands.
+
+#include <QHash>
+#include <QMutex>
+#include <QObject>
+#include <QSet>
+#include <QString>
+
+namespace fincept::services {
+
+class SectorResolver : public QObject {
+    Q_OBJECT
+
+  public:
+    static SectorResolver& instance();
+
+    // Synchronous lookup. Returns the cached sector or an empty string if
+    // unknown. When empty, triggers an async fetch (unless already in flight)
+    // — subscribe to sector_resolved() to get the result.
+    QString sector_for(const QString& symbol);
+
+    // Remember an authoritative sector (e.g. from portfolio import JSON).
+    // Overwrites any cached value and persists to disk.
+    void remember(const QString& symbol, const QString& sector);
+
+    // Kick off resolution for multiple symbols at once. Results fan out via
+    // sector_resolved() as they come back.
+    void prefetch(const QStringList& symbols);
+
+  signals:
+    void sector_resolved(QString symbol, QString sector);
+
+  private:
+    SectorResolver();
+    ~SectorResolver() override = default;
+    SectorResolver(const SectorResolver&) = delete;
+    SectorResolver& operator=(const SectorResolver&) = delete;
+
+    /// One resolved symbol. `negative` marks a placeholder produced by
+    /// fallback_for_unresolvable() rather than a real upstream answer, so
+    /// sector_for() can expire it after kNegativeTtlSeconds and retry.
+    struct Entry {
+        QString sector;
+        qint64 resolved_at = 0;
+        bool negative = false;
+    };
+
+    void load_cache();
+    void persist(const QString& symbol, const QString& sector, const QString& industry, const QString& quote_type,
+                 qint64 resolved_at);
+    void resolve_async(const QString& symbol);
+    static QString normalize(const QString& symbol);
+    static QString fallback_for_unresolvable(const QString& symbol);
+
+    mutable QMutex mutex_;
+    QHash<QString, Entry> cache_; // symbol → resolved sector + provenance
+    QSet<QString> inflight_;      // symbols currently being fetched
+};
+
+} // namespace fincept::services

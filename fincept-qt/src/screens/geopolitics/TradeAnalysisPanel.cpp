@@ -1,0 +1,630 @@
+// src/screens/geopolitics/TradeAnalysisPanel.cpp
+#include "screens/geopolitics/TradeAnalysisPanel.h"
+
+#include "services/geopolitics/GeopoliticsService.h"
+#include "ui/theme/Theme.h"
+
+#include <QDoubleSpinBox>
+#include <QGridLayout>
+#include <QHBoxLayout>
+#include <QHeaderView>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QScrollArea>
+#include <QTableWidget>
+
+namespace fincept::screens {
+
+using namespace fincept::services::geo;
+
+TradeAnalysisPanel::TradeAnalysisPanel(QWidget* parent) : QWidget(parent) {
+    build_ui();
+    connect_service();
+}
+
+void TradeAnalysisPanel::connect_service() {
+    auto& svc = GeopoliticsService::instance();
+    connect(&svc, &GeopoliticsService::trade_result_ready, this, &TradeAnalysisPanel::on_trade_result);
+    connect(&svc, &GeopoliticsService::error_occurred, this, &TradeAnalysisPanel::on_error);
+}
+
+// ── Shared style helpers ──────────────────────────────────────────────────────
+static QString warn_rgb() {
+    QColor c(ui::colors::WARNING());
+    return QString("%1,%2,%3").arg(c.red()).arg(c.green()).arg(c.blue());
+}
+
+static QString combo_style() {
+    return QString("QComboBox { background:%1; color:%2; border:1px solid %3;"
+                   "font-family:%4; font-size:%5px; padding:4px 8px; }"
+                   "QComboBox:focus { border-color:%6; }"
+                   "QComboBox::drop-down { border:none; width:18px; }"
+                   "QComboBox QAbstractItemView { background:%1; color:%2; "
+                   "selection-background-color:rgba(%7,0.15); border:1px solid %3; }")
+        .arg(ui::colors::BG_RAISED(), ui::colors::TEXT_PRIMARY(), ui::colors::BORDER_MED())
+        .arg(ui::fonts::DATA_FAMILY)
+        .arg(ui::fonts::SMALL)
+        .arg(ui::colors::WARNING())
+        .arg(warn_rgb());
+}
+
+static QString spin_style() {
+    return QString("QDoubleSpinBox { background:%1; color:%2; border:1px solid %3;"
+                   "font-family:%4; font-size:%5px; padding:4px 6px; }"
+                   "QDoubleSpinBox:focus { border-color:%6; }")
+        .arg(ui::colors::BG_RAISED(), ui::colors::TEXT_PRIMARY(), ui::colors::BORDER_MED())
+        .arg(ui::fonts::DATA_FAMILY)
+        .arg(ui::fonts::SMALL)
+        .arg(ui::colors::WARNING());
+}
+
+void TradeAnalysisPanel::begin_analysis() {
+    status_label_->setText(tr("Analyzing..."));
+    for (auto* btn : run_buttons_)
+        if (btn)
+            btn->setEnabled(false);
+}
+
+void TradeAnalysisPanel::end_analysis() {
+    for (auto* btn : run_buttons_)
+        if (btn)
+            btn->setEnabled(true);
+}
+
+static QWidget* make_field(const QString& label_text, QWidget* input, QWidget* parent, const QString& hint = {}) {
+    auto* group = new QWidget(parent);
+    auto* vl = new QVBoxLayout(group);
+    vl->setContentsMargins(0, 0, 0, 0);
+    vl->setSpacing(3);
+
+    auto* lbl = new QLabel(label_text, group);
+    lbl->setStyleSheet(QString("color:%1; font-size:%2px; font-weight:700; font-family:%3; letter-spacing:1px;")
+                           .arg(ui::colors::TEXT_TERTIARY())
+                           .arg(ui::fonts::TINY)
+                           .arg(ui::fonts::DATA_FAMILY));
+    vl->addWidget(lbl);
+
+    input->setParent(group);
+    vl->addWidget(input);
+
+    if (!hint.isEmpty()) {
+        auto* h = new QLabel(hint, group);
+        h->setStyleSheet(QString("color:%1; font-size:%2px; font-family:%3;")
+                             .arg(ui::colors::TEXT_TERTIARY())
+                             .arg(ui::fonts::TINY)
+                             .arg(ui::fonts::DATA_FAMILY));
+        h->setWordWrap(true);
+        vl->addWidget(h);
+    }
+    return group;
+}
+
+void TradeAnalysisPanel::build_ui() {
+    auto* root = new QVBoxLayout(this);
+    root->setContentsMargins(0, 0, 0, 0);
+    root->setSpacing(0);
+
+    // Header
+    auto* header = new QWidget(this);
+    header->setFixedHeight(48);
+    header->setStyleSheet(
+        QString("background:%1; border-bottom:1px solid %2;").arg(ui::colors::BG_RAISED(), ui::colors::BORDER_DIM()));
+    auto* hhl = new QHBoxLayout(header);
+    hhl->setContentsMargins(16, 0, 16, 0);
+    title_lbl_ = new QLabel(tr("TRADE GEOPOLITICS ANALYSIS"), header);
+    title_lbl_->setStyleSheet(QString("color:%1; font-size:%2px; font-weight:700; font-family:%3; letter-spacing:1px;")
+                                  .arg(ui::colors::WARNING())
+                                  .arg(ui::fonts::TINY)
+                                  .arg(ui::fonts::DATA_FAMILY()));
+    hhl->addWidget(title_lbl_);
+    hhl->addStretch();
+    status_label_ = new QLabel(header);
+    status_label_->setStyleSheet(QString("color:%1; font-size:%2px; font-family:%3;")
+                                     .arg(ui::colors::TEXT_TERTIARY())
+                                     .arg(ui::fonts::SMALL)
+                                     .arg(ui::fonts::DATA_FAMILY));
+    hhl->addWidget(status_label_);
+    root->addWidget(header);
+
+    // Scrollable content
+    auto* scroll = new QScrollArea(this);
+    scroll->setWidgetResizable(true);
+    scroll->setStyleSheet("QScrollArea { border:none; background:transparent; }");
+
+    auto* content = new QWidget(scroll);
+    auto* cvl = new QVBoxLayout(content);
+    cvl->setContentsMargins(16, 16, 16, 16);
+    cvl->setSpacing(12);
+
+    // ── Analysis Type selector ────────────────────────────────────────────────
+    type_combo_ = new QComboBox;
+    type_combo_->setStyleSheet(combo_style());
+    type_combo_->addItem(tr("Benefits & Costs of Trade"), "benefits_costs");
+    type_combo_->addItem(tr("Trade Restrictions Analysis"), "restrictions");
+    type_combo_->addItem(tr("Trading Blocs Analysis"), "trading_blocs");
+    type_combo_->addItem(tr("Trade Barrier Removal Impact"), "barrier_removal");
+    auto* type_combo = type_combo_; // keep local name for the signal wiring below
+    cvl->addWidget(make_field(tr("ANALYSIS TYPE"), type_combo, content));
+
+    // ── Tab widget for params per analysis type ───────────────────────────────
+    tabs_ = new QTabWidget(content);
+    tabs_->setStyleSheet(QString("QTabWidget::pane { border:1px solid %1; background:%2; }"
+                                 "QTabBar::tab { background:%3; color:%4; padding:5px 16px;"
+                                 "font-family:%5; font-size:%6px; border:1px solid %1; border-bottom:none; }"
+                                 "QTabBar::tab:selected { background:%2; color:%7; font-weight:700;"
+                                 "border-bottom:2px solid %7; }")
+                             .arg(ui::colors::BORDER_DIM(), ui::colors::BG_SURFACE(), ui::colors::BG_RAISED())
+                             .arg(ui::colors::TEXT_SECONDARY())
+                             .arg(ui::fonts::DATA_FAMILY)
+                             .arg(ui::fonts::SMALL)
+                             .arg(ui::colors::WARNING()));
+
+    // ── Page 0: Benefits & Costs ──────────────────────────────────────────────
+    auto* p0 = new QWidget(this);
+    auto* p0l = new QVBoxLayout(p0);
+    p0l->setContentsMargins(12, 12, 12, 12);
+    p0l->setSpacing(10);
+
+    auto* hint0 = new QLabel(tr("Analyzes efficiency gains, consumer benefits, growth effects, and adjustment costs of "
+                                "international trade."),
+                             p0);
+    hint0->setWordWrap(true);
+    hint0->setStyleSheet(QString("color:%1; font-size:%2px; font-family:%3;")
+                             .arg(ui::colors::TEXT_SECONDARY())
+                             .arg(ui::fonts::SMALL)
+                             .arg(ui::fonts::DATA_FAMILY));
+    i18n_labels_.append({hint0, QStringLiteral("Analyzes efficiency gains, consumer benefits, growth effects, and "
+                                               "adjustment costs of international trade.")});
+    p0l->addWidget(hint0);
+
+    auto* vol_spin = new QDoubleSpinBox;
+    vol_spin->setRange(0, 100);
+    vol_spin->setValue(30);
+    vol_spin->setSuffix(tr("% of GDP"));
+    vol_spin->setStyleSheet(spin_style());
+    p0l->addWidget(make_field(tr("TRADE VOLUME"), vol_spin, p0, tr("Trade as % of GDP (world avg ~60%)")));
+
+    auto* price_spin = new QDoubleSpinBox;
+    price_spin->setRange(0, 50);
+    price_spin->setValue(5);
+    price_spin->setSuffix("%");
+    price_spin->setStyleSheet(spin_style());
+    p0l->addWidget(
+        make_field(tr("EXPECTED PRICE REDUCTION"), price_spin, p0, tr("Consumer price reduction from trade openness")));
+
+    auto* cons_spin = new QDoubleSpinBox;
+    cons_spin->setRange(0, 100);
+    cons_spin->setValue(30);
+    cons_spin->setSuffix(tr("% of consumption"));
+    cons_spin->setStyleSheet(spin_style());
+    p0l->addWidget(
+        make_field(tr("TRADED GOODS SHARE"), cons_spin, p0, tr("Share of consumption from tradeable goods")));
+
+    p0l->addStretch();
+
+    // Store spinboxes for use in run button
+    auto* run0 = new QPushButton(tr("RUN ANALYSIS"), p0);
+    run0->setCursor(Qt::PointingHandCursor);
+    run0->setStyleSheet([&]() {
+        QColor w(ui::colors::WARNING());
+        return QString("QPushButton { background:%1; color:%2; font-family:%3; font-size:%4px;"
+                       "font-weight:700; border:none; padding:6px 16px; }"
+                       "QPushButton:hover { background:%5; }")
+            .arg(ui::colors::WARNING())
+            .arg(ui::colors::BG_BASE())
+            .arg(ui::fonts::DATA_FAMILY())
+            .arg(ui::fonts::SMALL)
+            .arg(w.darker(120).name());
+    }());
+    connect(run0, &QPushButton::clicked, this, [this, vol_spin, price_spin, cons_spin]() {
+        begin_analysis();
+        QJsonObject p;
+        p["trade_volume_gdp"] = vol_spin->value();
+        p["price_reduction_percent"] = price_spin->value();
+        p["traded_goods_consumption"] = cons_spin->value();
+        GeopoliticsService::instance().analyze_trade_benefits(p);
+    });
+    p0l->addWidget(run0);
+    run_buttons_.append(run0);
+    tabs_->addTab(p0, tr("Benefits & Costs"));
+
+    // ── Page 1: Restrictions ──────────────────────────────────────────────────
+    auto* p1 = new QWidget(this);
+    auto* p1l = new QVBoxLayout(p1);
+    p1l->setContentsMargins(12, 12, 12, 12);
+    p1l->setSpacing(10);
+
+    auto* hint1 =
+        new QLabel(tr("Analyzes economic impact of tariffs, quotas, export subsidies, and non-tariff barriers."), p1);
+    hint1->setWordWrap(true);
+    hint1->setStyleSheet(QString("color:%1; font-size:%2px; font-family:%3;")
+                             .arg(ui::colors::TEXT_SECONDARY())
+                             .arg(ui::fonts::SMALL)
+                             .arg(ui::fonts::DATA_FAMILY));
+    i18n_labels_.append(
+        {hint1,
+         QStringLiteral("Analyzes economic impact of tariffs, quotas, export subsidies, and non-tariff barriers.")});
+    p1l->addWidget(hint1);
+
+    auto* tariff_spin = new QDoubleSpinBox;
+    tariff_spin->setRange(0, 200);
+    tariff_spin->setValue(10);
+    tariff_spin->setSuffix("%");
+    tariff_spin->setStyleSheet(spin_style());
+    p1l->addWidget(
+        make_field(tr("TARIFF RATE"), tariff_spin, p1, tr("Import duty rate (e.g. 10% = standard MFN tariff)")));
+
+    auto* quota_spin = new QDoubleSpinBox;
+    quota_spin->setRange(0, 1000000);
+    quota_spin->setValue(1000);
+    quota_spin->setSuffix(tr(" units"));
+    quota_spin->setStyleSheet(spin_style());
+    p1l->addWidget(make_field(tr("QUOTA VOLUME"), quota_spin, p1, tr("Annual import quantity limit")));
+
+    auto* subsidy_spin = new QDoubleSpinBox;
+    subsidy_spin->setRange(0, 100);
+    subsidy_spin->setValue(5);
+    subsidy_spin->setSuffix("%");
+    subsidy_spin->setStyleSheet(spin_style());
+    p1l->addWidget(
+        make_field(tr("EXPORT SUBSIDY RATE"), subsidy_spin, p1, tr("Government subsidy as % of export value")));
+
+    auto* dev_combo = new QComboBox;
+    dev_combo->setStyleSheet(combo_style());
+    dev_combo->addItem(tr("Developed Economy"), "developed");
+    dev_combo->addItem(tr("Developing Economy"), "developing");
+    dev_combo->addItem(tr("Middle Income"), "middle");
+    p1l->addWidget(make_field(tr("DEVELOPMENT LEVEL"), dev_combo, p1));
+
+    auto* maturity_combo = new QComboBox;
+    maturity_combo->setStyleSheet(combo_style());
+    maturity_combo->addItem(tr("Mature Industry"), "mature");
+    maturity_combo->addItem(tr("Infant Industry"), "infant");
+    maturity_combo->addItem(tr("Emerging Industry"), "emerging");
+    p1l->addWidget(make_field(tr("INDUSTRY MATURITY"), maturity_combo, p1));
+
+    p1l->addStretch();
+
+    auto* run1 = new QPushButton(tr("RUN ANALYSIS"), p1);
+    run1->setCursor(Qt::PointingHandCursor);
+    run1->setStyleSheet([&]() {
+        QColor w(ui::colors::WARNING());
+        return QString("QPushButton { background:%1; color:%2; font-family:%3; font-size:%4px;"
+                       "font-weight:700; border:none; padding:6px 16px; }"
+                       "QPushButton:hover { background:%5; }")
+            .arg(ui::colors::WARNING())
+            .arg(ui::colors::BG_BASE())
+            .arg(ui::fonts::DATA_FAMILY())
+            .arg(ui::fonts::SMALL)
+            .arg(w.darker(120).name());
+    }());
+    connect(run1, &QPushButton::clicked, this,
+            [this, tariff_spin, quota_spin, subsidy_spin, dev_combo, maturity_combo]() {
+                begin_analysis();
+                QJsonObject p;
+                p["tariff_rate"] = tariff_spin->value();
+                p["quota_volume"] = quota_spin->value();
+                p["subsidy_rate"] = subsidy_spin->value();
+                p["development_level"] = dev_combo->currentData().toString();
+                p["industry_maturity"] = maturity_combo->currentData().toString();
+                GeopoliticsService::instance().analyze_trade_restrictions(p);
+            });
+    p1l->addWidget(run1);
+    run_buttons_.append(run1);
+    tabs_->addTab(p1, tr("Restrictions"));
+
+    // ── Page 2: Trading Blocs ─────────────────────────────────────────────────
+    auto* p2 = new QWidget(this);
+    auto* p2l = new QVBoxLayout(p2);
+    p2l->setContentsMargins(12, 12, 12, 12);
+    p2l->setSpacing(10);
+
+    auto* hint2 = new QLabel(
+        tr("Analyzes trade creation vs. diversion effects for regional trade blocs and economic unions."), p2);
+    hint2->setWordWrap(true);
+    hint2->setStyleSheet(QString("color:%1; font-size:%2px; font-family:%3;")
+                             .arg(ui::colors::TEXT_SECONDARY())
+                             .arg(ui::fonts::SMALL)
+                             .arg(ui::fonts::DATA_FAMILY));
+    i18n_labels_.append(
+        {hint2, QStringLiteral(
+                    "Analyzes trade creation vs. diversion effects for regional trade blocs and economic unions.")});
+    p2l->addWidget(hint2);
+
+    auto* bloc_combo = new QComboBox;
+    bloc_combo->setStyleSheet(combo_style());
+    bloc_combo->addItem(tr("Free Trade Area (e.g. USMCA, ASEAN)"), "fta");
+    bloc_combo->addItem(tr("Customs Union (e.g. EU, Mercosur)"), "customs_union");
+    bloc_combo->addItem(tr("Common Market (e.g. EU Single Market)"), "common_market");
+    bloc_combo->addItem(tr("Economic Union (e.g. European Union)"), "economic_union");
+    p2l->addWidget(make_field(tr("INTEGRATION TYPE"), bloc_combo, p2));
+
+    auto* tc_spin = new QDoubleSpinBox;
+    tc_spin->setRange(0, 1000);
+    tc_spin->setValue(100);
+    tc_spin->setSuffix(tr("B USD"));
+    tc_spin->setStyleSheet(spin_style());
+    p2l->addWidget(
+        make_field(tr("TRADE CREATION ESTIMATE"), tc_spin, p2, tr("Expected new trade generated within bloc")));
+
+    auto* td_spin = new QDoubleSpinBox;
+    td_spin->setRange(0, 1000);
+    td_spin->setValue(30);
+    td_spin->setSuffix(tr("B USD"));
+    td_spin->setStyleSheet(spin_style());
+    p2l->addWidget(
+        make_field(tr("TRADE DIVERSION ESTIMATE"), td_spin, p2, tr("Trade diverted from efficient non-members")));
+
+    p2l->addStretch();
+
+    auto* run2 = new QPushButton(tr("RUN ANALYSIS"), p2);
+    run2->setCursor(Qt::PointingHandCursor);
+    run2->setStyleSheet([&]() {
+        QColor w(ui::colors::WARNING());
+        return QString("QPushButton { background:%1; color:%2; font-family:%3; font-size:%4px;"
+                       "font-weight:700; border:none; padding:6px 16px; }"
+                       "QPushButton:hover { background:%5; }")
+            .arg(ui::colors::WARNING())
+            .arg(ui::colors::BG_BASE())
+            .arg(ui::fonts::DATA_FAMILY())
+            .arg(ui::fonts::SMALL)
+            .arg(w.darker(120).name());
+    }());
+    connect(run2, &QPushButton::clicked, this, [this, bloc_combo, tc_spin, td_spin]() {
+        begin_analysis();
+        QJsonObject p;
+        p["integration_type"] = bloc_combo->currentData().toString();
+        p["trade_creation"] = tc_spin->value();
+        p["trade_diversion"] = td_spin->value();
+        // Dedicated trading_blocs mode: reads trade_creation / trade_diversion.
+        GeopoliticsService::instance().analyze_trading_blocs(p);
+    });
+    p2l->addWidget(run2);
+    run_buttons_.append(run2);
+    tabs_->addTab(p2, tr("Trading Blocs"));
+
+    // ── Page 3: Barrier Removal ───────────────────────────────────────────────
+    auto* p3 = new QWidget(this);
+    auto* p3l = new QVBoxLayout(p3);
+    p3l->setContentsMargins(12, 12, 12, 12);
+    p3l->setSpacing(10);
+
+    auto* hint3 = new QLabel(tr("Assesses FDI, employment, wage, and GDP impact of removing trade barriers."), p3);
+    hint3->setWordWrap(true);
+    hint3->setStyleSheet(QString("color:%1; font-size:%2px; font-family:%3;")
+                             .arg(ui::colors::TEXT_SECONDARY())
+                             .arg(ui::fonts::SMALL)
+                             .arg(ui::fonts::DATA_FAMILY));
+    i18n_labels_.append(
+        {hint3, QStringLiteral("Assesses FDI, employment, wage, and GDP impact of removing trade barriers.")});
+    p3l->addWidget(hint3);
+
+    auto* lib_combo = new QComboBox;
+    lib_combo->setStyleSheet(combo_style());
+    lib_combo->addItem(tr("Unilateral Liberalization"), "unilateral");
+    lib_combo->addItem(tr("Bilateral Agreement"), "bilateral");
+    lib_combo->addItem(tr("Regional Agreement"), "regional");
+    lib_combo->addItem(tr("Multilateral (WTO Round)"), "multilateral");
+    p3l->addWidget(make_field(tr("LIBERALIZATION SCOPE"), lib_combo, p3));
+
+    auto* tariff_cut_spin = new QDoubleSpinBox;
+    tariff_cut_spin->setRange(0, 100);
+    tariff_cut_spin->setValue(50);
+    tariff_cut_spin->setSuffix(tr("% reduction"));
+    tariff_cut_spin->setStyleSheet(spin_style());
+    p3l->addWidget(make_field(tr("TARIFF REDUCTION"), tariff_cut_spin, p3, tr("% cut in existing tariff rates")));
+
+    auto* gdp_spin = new QDoubleSpinBox;
+    gdp_spin->setRange(0, 100000);
+    gdp_spin->setValue(500);
+    gdp_spin->setSuffix(tr("B USD"));
+    gdp_spin->setStyleSheet(spin_style());
+    p3l->addWidget(make_field(tr("ECONOMY SIZE (GDP)"), gdp_spin, p3));
+
+    p3l->addStretch();
+
+    auto* run3 = new QPushButton(tr("RUN ANALYSIS"), p3);
+    run3->setCursor(Qt::PointingHandCursor);
+    run3->setStyleSheet([&]() {
+        QColor w(ui::colors::WARNING());
+        return QString("QPushButton { background:%1; color:%2; font-family:%3; font-size:%4px;"
+                       "font-weight:700; border:none; padding:6px 16px; }"
+                       "QPushButton:hover { background:%5; }")
+            .arg(ui::colors::WARNING())
+            .arg(ui::colors::BG_BASE())
+            .arg(ui::fonts::DATA_FAMILY())
+            .arg(ui::fonts::SMALL)
+            .arg(w.darker(120).name());
+    }());
+    connect(run3, &QPushButton::clicked, this, [this, lib_combo, tariff_cut_spin, gdp_spin]() {
+        begin_analysis();
+        QJsonObject p;
+        const QString type = lib_combo->currentData().toString();
+        p["liberalization_type"] = type;
+        p["tariff_reduction"] = tariff_cut_spin->value();
+        p["gdp_size"] = gdp_spin->value();
+        // The backend's FDI estimate is keyed on a limited / moderate / comprehensive
+        // scope: the more parties to the agreement, the broader the scope.
+        p["liberalization_scope"] = type == QLatin1String("unilateral")      ? QStringLiteral("limited")
+                                    : type == QLatin1String("multilateral") ? QStringLiteral("comprehensive")
+                                                                            : QStringLiteral("moderate");
+        GeopoliticsService::instance().analyze_barrier_removal(p);
+    });
+    p3l->addWidget(run3);
+    run_buttons_.append(run3);
+    tabs_->addTab(p3, tr("Barrier Removal"));
+
+    // Sync analysis type combo → tab
+    connect(type_combo, QOverload<int>::of(&QComboBox::currentIndexChanged), tabs_, &QTabWidget::setCurrentIndex);
+    connect(tabs_, &QTabWidget::currentChanged, type_combo, &QComboBox::setCurrentIndex);
+
+    cvl->addWidget(tabs_);
+
+    // Results area
+    results_container_ = new QWidget(content);
+    results_layout_ = new QVBoxLayout(results_container_);
+    results_layout_->setContentsMargins(0, 8, 0, 0);
+    results_layout_->setSpacing(8);
+    cvl->addWidget(results_container_);
+
+    scroll->setWidget(content);
+    root->addWidget(scroll, 1);
+}
+
+void TradeAnalysisPanel::display_result(const QJsonObject& payload) {
+    while (results_layout_->count() > 0) {
+        auto* item = results_layout_->takeAt(0);
+        if (item->widget())
+            item->widget()->deleteLater();
+        delete item;
+    }
+
+    auto* sep = new QWidget(this);
+    sep->setFixedHeight(1);
+    sep->setStyleSheet(QString("background:%1;").arg(ui::colors::BORDER_DIM()));
+    results_layout_->addWidget(sep);
+
+    auto* hdr = new QLabel(tr("ANALYSIS RESULTS"));
+    hdr->setStyleSheet(QString("color:%1; font-size:%2px; font-weight:700; font-family:%3;"
+                               "letter-spacing:1px; padding:8px 0 4px 0;")
+                           .arg(ui::colors::WARNING())
+                           .arg(ui::fonts::TINY)
+                           .arg(ui::fonts::DATA_FAMILY()));
+    results_layout_->addWidget(hdr);
+
+    // Flatten and display JSON as a table
+    QVector<QPair<QString, QString>> rows;
+    std::function<void(const QJsonObject&, const QString&)> flatten = [&](const QJsonObject& obj,
+                                                                          const QString& prefix) {
+        for (auto it = obj.begin(); it != obj.end(); ++it) {
+            QString key = prefix.isEmpty() ? it.key() : prefix + " › " + it.key();
+            if (it.value().isObject()) {
+                flatten(it.value().toObject(), key);
+            } else if (it.value().isArray()) {
+                QStringList items;
+                for (const auto& v : it.value().toArray())
+                    items << v.toString();
+                rows.append({key, items.join(", ")});
+            } else {
+                QString val = it.value().isDouble() ? QString::number(it.value().toDouble(), 'f', 2)
+                              : it.value().isBool() ? (it.value().toBool() ? tr("YES") : tr("NO"))
+                                                    : it.value().toString();
+                if (!val.isEmpty())
+                    rows.append({key, val});
+            }
+        }
+    };
+    flatten(payload, "");
+
+    auto* table = new QTableWidget(rows.size(), 2);
+    table->setHorizontalHeaderLabels({tr("Metric"), tr("Value")});
+    table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    table->setAlternatingRowColors(true);
+    table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+    table->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
+    table->verticalHeader()->setVisible(false);
+    table->verticalHeader()->setDefaultSectionSize(24);
+    table->setStyleSheet(QString("QTableWidget { background:%1; color:%2; gridline-color:%3;"
+                                 "font-family:%4; font-size:%5px; border:1px solid %3; }"
+                                 "QTableWidget::item { padding:3px 8px; }"
+                                 "QHeaderView::section { background:%6; color:%7; font-weight:700;"
+                                 "padding:4px 8px; border:1px solid %3; font-family:%4; font-size:%5px; }"
+                                 "QTableWidget::item:alternate { background:%8; }")
+                             .arg(ui::colors::BG_SURFACE(), ui::colors::TEXT_PRIMARY(), ui::colors::BORDER_DIM())
+                             .arg(ui::fonts::DATA_FAMILY)
+                             .arg(ui::fonts::SMALL)
+                             .arg(ui::colors::BG_RAISED())
+                             .arg(ui::colors::TEXT_SECONDARY())
+                             .arg(ui::colors::ROW_ALT()));
+
+    for (int r = 0; r < rows.size(); ++r) {
+        auto key = rows[r].first;
+        key.replace('_', ' ');
+        table->setItem(r, 0, new QTableWidgetItem(key));
+        auto* vi = new QTableWidgetItem(rows[r].second);
+        vi->setToolTip(rows[r].second);
+        table->setItem(r, 1, vi);
+    }
+    results_layout_->addWidget(table);
+    status_label_->setText(tr("%1 fields").arg(rows.size()));
+}
+
+static bool is_trade_context(const QString& context) {
+    return context == QLatin1String("trade_benefits") || context == QLatin1String("trade_restrictions") ||
+           context == QLatin1String("trade_blocs") || context == QLatin1String("trade_barrier");
+}
+
+void TradeAnalysisPanel::on_trade_result(const QString& context, const QJsonObject& payload) {
+    if (!is_trade_context(context))
+        return;
+    end_analysis();
+    display_result(payload);
+}
+
+void TradeAnalysisPanel::on_error(const QString& context, const QString& message) {
+    if (!is_trade_context(context))
+        return;
+    end_analysis();
+    status_label_->setText(tr("Error"));
+    while (results_layout_->count() > 0) {
+        auto* item = results_layout_->takeAt(0);
+        if (item->widget())
+            item->widget()->deleteLater();
+        delete item;
+    }
+    auto* err = new QLabel(QString("[%1] %2").arg(context, message));
+    err->setWordWrap(true);
+    err->setStyleSheet([&]() {
+        QColor neg(ui::colors::NEGATIVE());
+        auto neg_rgb = QString("%1,%2,%3").arg(neg.red()).arg(neg.green()).arg(neg.blue());
+        return QString("color:%1; font-size:%2px; font-family:%3; padding:12px;"
+                       "background:rgba(%4,0.08); border:1px solid rgba(%4,0.3);")
+            .arg(ui::colors::NEGATIVE())
+            .arg(ui::fonts::SMALL)
+            .arg(ui::fonts::DATA_FAMILY())
+            .arg(neg_rgb);
+    }());
+    results_layout_->addWidget(err);
+}
+
+void TradeAnalysisPanel::changeEvent(QEvent* event) {
+    if (event->type() == QEvent::LanguageChange)
+        retranslateUi();
+    QWidget::changeEvent(event);
+}
+
+void TradeAnalysisPanel::retranslateUi() {
+    if (title_lbl_)
+        title_lbl_->setText(tr("TRADE GEOPOLITICS ANALYSIS"));
+
+    // Analysis-type combo display labels (data keys preserved).
+    if (type_combo_ && type_combo_->count() >= 4) {
+        type_combo_->setItemText(0, tr("Benefits & Costs of Trade"));
+        type_combo_->setItemText(1, tr("Trade Restrictions Analysis"));
+        type_combo_->setItemText(2, tr("Trading Blocs Analysis"));
+        type_combo_->setItemText(3, tr("Trade Barrier Removal Impact"));
+    }
+
+    // Tab labels (declared order matches addTab order).
+    if (tabs_ && tabs_->count() >= 4) {
+        tabs_->setTabText(0, tr("Benefits & Costs"));
+        tabs_->setTabText(1, tr("Restrictions"));
+        tabs_->setTabText(2, tr("Trading Blocs"));
+        tabs_->setTabText(3, tr("Barrier Removal"));
+    }
+
+    // Run buttons
+    for (auto* btn : run_buttons_)
+        if (btn)
+            btn->setText(tr("RUN ANALYSIS"));
+
+    // Field captions + hints captured during build_ui().
+    for (const auto& pair : i18n_labels_)
+        if (pair.first)
+            pair.first->setText(tr(pair.second.toUtf8().constData()));
+
+    // status_label_ and the results table reflect the last action and refresh
+    // on the next run; per-field combo item labels are set at build time.
+}
+
+} // namespace fincept::screens

@@ -1,0 +1,574 @@
+#include "screens/dashboard/DashboardScreen.h"
+
+#include "core/events/EventBus.h"
+#include "core/logging/Logger.h"
+#include "datahub/DataHub.h"
+#include "datahub/DataHubMetaTypes.h"
+#include "screens/dashboard/canvas/AddWidgetDialog.h"
+#include "screens/dashboard/canvas/DashboardTemplates.h"
+#include "screens/dashboard/canvas/TemplatePicker.h"
+#include "screens/dashboard/canvas/WidgetRegistry.h"
+#include "screens/dashboard/widgets/BaseWidget.h"
+#include "services/markets/MarketDataService.h"
+#include "services/notifications/NotificationService.h"
+#include "storage/repositories/SettingsRepository.h"
+#include "ui/theme/Theme.h"
+#include "ui/theme/ThemeManager.h"
+#include "ui/widgets/NotifToast.h"
+
+#include <QDataStream>
+#include <QJsonDocument>
+#include <QEvent>
+#include <QHideEvent>
+#include <QKeySequence>
+#include <QPalette>
+#include <QPointer>
+#include <QShortcut>
+#include <QShowEvent>
+#include <QVBoxLayout>
+#include <QtConcurrent/QtConcurrent>
+
+namespace {
+
+void apply_solid_background(QWidget* widget, const QColor& color) {
+    if (!widget)
+        return;
+
+    widget->setAttribute(Qt::WA_StyledBackground, true);
+    widget->setAutoFillBackground(true);
+
+    QPalette pal = widget->palette();
+    pal.setColor(QPalette::Window, color);
+    pal.setColor(QPalette::Base, color);
+    pal.setColor(QPalette::Button, color);
+    widget->setPalette(pal);
+}
+
+} // namespace
+
+namespace fincept::screens {
+
+DashboardScreen::DashboardScreen(QWidget* parent) : QWidget(parent) {
+    apply_solid_background(this, QColor(ui::colors::BG_BASE()));
+    refresh_theme();
+
+    auto* vl = new QVBoxLayout(this);
+    vl->setContentsMargins(0, 0, 0, 0);
+    vl->setSpacing(0);
+
+    // ── Top Toolbar ──
+    toolbar_ = new DashboardToolBar;
+    vl->addWidget(toolbar_);
+
+    // ── Scrolling Ticker Bar ──
+    ticker_bar_ = new TickerBar;
+    vl->addWidget(ticker_bar_);
+    // When user saves a new symbol list, re-fetch quotes immediately.
+    connect(ticker_bar_, &TickerBar::symbols_changed, this, &DashboardScreen::refresh_ticker);
+    // Double-click a symbol in the strip → open it in Equity Research.
+    connect(ticker_bar_, &TickerBar::symbol_activated, this, [](const QString& sym) {
+        EventBus::instance().publish("nav.open_symbol",
+                                     QVariantMap{{"screen_id", "equity_research"}, {"symbol", sym}});
+    });
+
+    // ── Main Content: Canvas (in scroll) + Market Pulse ──
+    content_split_ = new QSplitter(Qt::Horizontal);
+    content_split_->setHandleWidth(1);
+    content_split_->setStyleSheet(QString("QSplitter::handle{background:%1;}QSplitter::handle:hover{background:%2;}")
+                                      .arg(ui::colors::BORDER_DIM(), ui::colors::BORDER_MED()));
+
+    canvas_ = new DashboardCanvas;
+
+    // Scroll area wraps canvas — provides vertical scroll when content exceeds viewport
+    scroll_area_ = new QScrollArea;
+    scroll_area_->setWidgetResizable(false); // canvas controls its own size
+    scroll_area_->setMinimumWidth(0);        // allow ADS to shrink this panel freely
+    scroll_area_->setWidget(canvas_);
+    scroll_area_->setStyleSheet(QString("QScrollArea{border:none;background:%1;}"
+                                        "QScrollBar:vertical{width:6px;background:transparent;}"
+                                        "QScrollBar::handle:vertical{background:%2;border-radius:3px;min-height:20px;}"
+                                        "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;}")
+                                    .arg(ui::colors::BG_BASE(), ui::colors::BORDER_MED()));
+    scroll_area_->viewport()->setStyleSheet(QString("background:%1;").arg(ui::colors::BG_BASE()));
+
+    // Sync canvas width to scroll viewport via event filter
+    scroll_area_->viewport()->installEventFilter(this);
+
+    market_pulse_ = new MarketPulsePanel;
+
+    content_split_->addWidget(scroll_area_);
+    content_split_->addWidget(market_pulse_);
+    content_split_->setStretchFactor(0, 3);
+    content_split_->setStretchFactor(1, 1);
+    content_split_->setCollapsible(0, false);
+    content_split_->setCollapsible(1, false);
+    market_pulse_->setMinimumWidth(180);
+
+    vl->addWidget(content_split_, 1);
+
+    // ── Bottom Status Bar ──
+    status_bar_ = new DashboardStatusBar;
+    vl->addWidget(status_bar_);
+
+    // ── In-app notification toast (overlay, not in layout) ────────────────────
+    notif_toast_ = new fincept::ui::NotifToast(this);
+    connect(&fincept::notifications::NotificationService::instance(),
+            &fincept::notifications::NotificationService::notification_received, notif_toast_,
+            &fincept::ui::NotifToast::show_notification);
+
+    // ── Debounced save timer (P3: not started in constructor) ──
+    save_timer_ = new QTimer(this);
+    save_timer_->setSingleShot(true);
+    save_timer_->setInterval(800);
+    connect(save_timer_, &QTimer::timeout, this, &DashboardScreen::save_layout);
+
+    // ── Canvas signals → toolbar/statusbar ──
+    connect(canvas_, &DashboardCanvas::widget_count_changed, toolbar_, &DashboardToolBar::set_widget_count);
+    connect(canvas_, &DashboardCanvas::widget_count_changed, status_bar_, &DashboardStatusBar::set_widget_count);
+    // The toolbar's LIVE badge was hardcoded — set_connected() had no caller
+    // anywhere in the codebase. Drive it from the status bar's API health probe.
+    connect(status_bar_, &DashboardStatusBar::connectivity_changed, toolbar_, &DashboardToolBar::set_connected);
+    connect(canvas_, &DashboardCanvas::layout_changed, this, [this](const GridLayout&) { save_timer_->start(); });
+
+    // ── Toolbar buttons ──
+    // Kept as named lambdas so the keyboard shortcuts below drive exactly the
+    // same code path as the toolbar buttons.
+    auto toggle_pulse = [this]() {
+        pulse_visible_ = !pulse_visible_;
+        market_pulse_->setVisible(pulse_visible_);
+    };
+    auto open_add_widget = [this]() {
+        auto* dlg = new AddWidgetDialog(this);
+        connect(dlg, &AddWidgetDialog::widget_selected, canvas_, &DashboardCanvas::add_widget);
+        dlg->exec();
+        dlg->deleteLater();
+    };
+
+    connect(toolbar_, &DashboardToolBar::toggle_pulse_clicked, this, toggle_pulse);
+
+    connect(toolbar_, &DashboardToolBar::add_widget_clicked, this, open_add_widget);
+
+    connect(toolbar_, &DashboardToolBar::reset_layout_clicked, this, [this]() {
+        auto* dlg = new TemplatePicker(this);
+        connect(dlg, &TemplatePicker::template_selected, this, [this](const QString& tid) {
+            // Clear saved state so fresh template is used
+            (void)QtConcurrent::run(
+                []() { fincept::SettingsRepository::instance().remove("dashboard_canvas_layout"); });
+            canvas_->apply_template(tid);
+        });
+        dlg->exec();
+        dlg->deleteLater();
+    });
+
+    connect(toolbar_, &DashboardToolBar::save_layout_clicked, this, &DashboardScreen::save_layout);
+
+    connect(toolbar_, &DashboardToolBar::refresh_clicked, this, &DashboardScreen::on_refresh_clicked);
+
+    connect(toolbar_, &DashboardToolBar::toggle_compact_clicked, this, [this]() {
+        // Derive the current mode from the canvas, not from a flag that starts
+        // false: a restored layout can already be compact (row_h is persisted),
+        // and the first click then did nothing visible (40 -> 40).
+        compact_rows_ = canvas_->current_layout().row_h > 40;
+        canvas_->set_row_height(compact_rows_ ? 40 : 60);
+    });
+
+    connect(&ui::ThemeManager::instance(), &ui::ThemeManager::theme_changed, this,
+            [this](const ui::ThemeTokens&) { refresh_theme(); });
+
+    // ── Keyboard shortcuts ────────────────────────────────────────────────────
+    // The dashboard had zero keyboard affordances; every action needed a mouse
+    // trip to the toolbar. WindowShortcut scope so they fire while any child
+    // of the dashboard has focus, but not while another screen is active.
+    auto add_shortcut = [this](QKeySequence seq, auto&& handler) {
+        auto* sc = new QShortcut(seq, this);
+        sc->setContext(Qt::WindowShortcut);
+        connect(sc, &QShortcut::activated, this, handler);
+    };
+    // No local F5 / Ctrl+P: those are the global Refresh and Screenshot actions in
+    // the same window, and two window-scoped shortcuts on one key are ambiguous to
+    // Qt, so neither fired. F5 still refreshes the dashboard — the frame's Refresh
+    // action invokes the focused panel's on_refresh_clicked() slot.
+    add_shortcut(QKeySequence(QKeySequence::Save), [this]() { save_layout(); });
+    add_shortcut(QKeySequence(Qt::CTRL | Qt::Key_N), open_add_widget);
+}
+
+// ── Theme ─────────────────────────────────────────────────────────────────────
+
+void DashboardScreen::refresh_theme() {
+    const QColor bg(ui::colors::BG_BASE());
+    apply_solid_background(this, bg);
+
+    setStyleSheet(QString("background:%1;").arg(ui::colors::BG_BASE()));
+    if (content_split_) {
+        apply_solid_background(content_split_, bg);
+        content_split_->setStyleSheet(
+            QString("QSplitter{background:%1;}QSplitter::handle{background:%2;}QSplitter::handle:hover{background:%3;}")
+                .arg(ui::colors::BG_BASE(), ui::colors::BORDER_DIM(), ui::colors::BORDER_MED()));
+    }
+    if (scroll_area_) {
+        apply_solid_background(scroll_area_, bg);
+        scroll_area_->setStyleSheet(
+            QString("QScrollArea{border:none;background:%1;}"
+                    "QScrollBar:vertical{width:6px;background:transparent;}"
+                    "QScrollBar::handle:vertical{background:%2;border-radius:3px;min-height:20px;}"
+                    "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;}")
+                .arg(ui::colors::BG_BASE(), ui::colors::BORDER_MED()));
+        // Ensure viewport doesn't paint its own opaque background over the canvas
+        apply_solid_background(scroll_area_->viewport(), bg);
+        scroll_area_->viewport()->setStyleSheet(QString("background:%1;").arg(ui::colors::BG_BASE()));
+    }
+}
+
+// ── Show/Hide ─────────────────────────────────────────────────────────────────
+
+void DashboardScreen::showEvent(QShowEvent* event) {
+    QWidget::showEvent(event);
+    refresh_theme();
+
+    if (ticker_bar_) {
+        // Honour the appearance settings that were previously saved but never
+        // read: "Show Ticker Bar" toggles visibility; "Enable Animations" toggles
+        // the scroll (off → the bar shows its symbols but doesn't animate).
+        auto& repo = SettingsRepository::instance();
+        const auto tr = repo.get("appearance.show_ticker_bar");
+        const bool show_ticker = !tr.is_ok() ? true : tr.value() != "false";
+        const auto ar = repo.get("appearance.animations");
+        const bool animations = !ar.is_ok() ? true : ar.value() != "false";
+        ticker_bar_->setVisible(show_ticker);
+        if (show_ticker && animations)
+            ticker_bar_->resume();
+        else
+            ticker_bar_->pause();
+    }
+
+    // Subscribe to current ticker symbols — hub schedules refreshes per TopicPolicy.
+    hub_resubscribe_ticker(/*force_fetch=*/false);
+
+    // Set splitter sizes on first show using actual pixel width.
+    // Must be done here (not in constructor) because the widget has no size yet
+    // during construction. MarketPulsePanel's large sizeHint otherwise causes it
+    // to claim ~70% of the splitter before the user sees it.
+    if (!split_sized_) {
+        split_sized_ = true;
+        const int total = content_split_->width();
+        if (total > 400) {
+            const int pulse_w = qBound(180, total / 4, 320);
+            content_split_->setSizes({total - pulse_w, pulse_w});
+        }
+    }
+
+    if (!layout_restored_) {
+        layout_restored_ = true;
+        restore_layout();
+    }
+}
+
+void DashboardScreen::hideEvent(QHideEvent* event) {
+    QWidget::hideEvent(event);
+    if (ticker_bar_)
+        ticker_bar_->pause();
+    hub_unsubscribe_ticker();
+}
+
+// ── Ticker refresh ────────────────────────────────────────────────────────────
+
+void DashboardScreen::refresh_ticker() {
+    if (!ticker_bar_)
+        return;
+    // TickerBar emits symbols_changed when its saved list finishes loading from
+    // the settings DB (async, started in its constructor). That can land while
+    // the dashboard is not on screen; subscribing then would leave the hub
+    // subscription alive past hideEvent(). showEvent() re-reads
+    // ticker_bar_->symbols() and subscribes, so nothing is lost by skipping.
+    if (!isVisible())
+        return;
+    // Hub path: user edited symbols → drop old subs, attach to new set,
+    // kick the hub so consumers see data immediately.
+    //
+    // Note: this used to early-return on an empty symbol list, which left the
+    // *previous* symbols subscribed and still scrolling after the user cleared
+    // the bar. hub_resubscribe_ticker() handles the empty case correctly
+    // (unsubscribe, then no-op).
+    hub_resubscribe_ticker(/*force_fetch=*/true);
+}
+
+void DashboardScreen::on_refresh_clicked() {
+    // Toolbar REFRESH button — force-refresh every live data source on the
+    // dashboard. The hub's per-producer rate limit is still honoured, so
+    // rage-clicking can't hammer upstream APIs.
+    if (ticker_bar_ && !ticker_subscribed_.isEmpty()) {
+        QStringList topics;
+        topics.reserve(ticker_subscribed_.size());
+        for (const QString& sym : ticker_subscribed_)
+            topics.append(QStringLiteral("market:quote:") + sym);
+        datahub::DataHub::instance().request(topics, /*force=*/true);
+    }
+    if (market_pulse_)
+        market_pulse_->refresh_data();
+    // Fan refresh out to every visible BaseWidget tile on the canvas.
+    // Hidden tiles (collapsed, off-screen, on a non-visible workspace) are
+    // skipped — refreshing them burns the producer's rate limit on data
+    // the user can't see, and the visibility-driven subscribe/unsubscribe
+    // (P3) means hidden widgets aren't subscribed anyway.
+    if (canvas_) {
+        const auto widgets = canvas_->findChildren<widgets::BaseWidget*>();
+        for (auto* w : widgets) {
+            if (w && w->isVisible())
+                w->request_refresh();
+        }
+    }
+}
+
+void DashboardScreen::rebuild_ticker_from_cache() {
+    if (!ticker_bar_)
+        return;
+    QVector<TickerBar::Entry> entries;
+    entries.reserve(ticker_subscribed_.size());
+    for (const auto& sym : ticker_subscribed_) {
+        if (!ticker_cache_.contains(sym))
+            continue;
+        const auto& q = ticker_cache_.value(sym);
+        // TickerBar renders this value with a trailing "%", so it must be the
+        // percent change — q.change is the absolute price move (e.g. +2.35 on a
+        // 190 stock showed as "+2.35%" instead of "+1.25%").
+        entries.append({q.symbol, q.price, q.change_pct});
+    }
+    if (!entries.isEmpty())
+        ticker_bar_->set_data(entries);
+}
+
+void DashboardScreen::hub_resubscribe_ticker(bool force_fetch) {
+    if (!ticker_bar_)
+        return;
+
+    auto& hub = datahub::DataHub::instance();
+    // Drop any prior subscriptions owned by this screen, since the symbol
+    // set may have changed (user edited ticker symbols).
+    hub.unsubscribe(this);
+    hub_active_ = false;
+    ticker_cache_.clear();
+
+    ticker_subscribed_ = ticker_bar_->symbols();
+    if (ticker_subscribed_.isEmpty()) {
+        ticker_bar_->set_data({}); // clear stale entries so nothing misleading scrolls
+        return;
+    }
+
+    QStringList topics;
+    topics.reserve(ticker_subscribed_.size());
+    for (const QString& sym : ticker_subscribed_) {
+        const QString topic = QStringLiteral("market:quote:") + sym;
+        topics.append(topic);
+        hub.subscribe(this, topic, [this, sym](const QVariant& v) {
+            if (!v.canConvert<services::QuoteData>())
+                return;
+            ticker_cache_.insert(sym, v.value<services::QuoteData>());
+            rebuild_ticker_from_cache();
+        });
+    }
+    // Force only after a user edit of the symbol list. On a plain tab show the
+    // subscribe() above already delivers fresh cached quotes and cold-starts a
+    // fetch for any stale/missing topic, so a forced request here just re-hit
+    // the upstream API on every tab flip.
+    hub.request(topics, force_fetch);
+    hub_active_ = true;
+}
+
+void DashboardScreen::hub_unsubscribe_ticker() {
+    if (!hub_active_)
+        return;
+    datahub::DataHub::instance().unsubscribe(this);
+    hub_active_ = false;
+}
+
+// ── Event filter: sync canvas width to scroll viewport ────────────────────────
+
+bool DashboardScreen::eventFilter(QObject* obj, QEvent* event) {
+    if (obj == scroll_area_->viewport() && event->type() == QEvent::Resize) {
+        int vp_w = scroll_area_->viewport()->width();
+        // Only update if width actually changed — avoids triggering
+        // resizeEvent → rebuild_grid_cache → reflow_tiles on every scroll tick.
+        // Use setMaximumWidth + resize instead of setFixedWidth so the canvas
+        // never imposes a minimum-width constraint that fights ADS splitters
+        // when two screens are placed side-by-side.
+        if (vp_w > 0 && vp_w != canvas_->width()) {
+            canvas_->setMinimumWidth(0);
+            canvas_->setMaximumWidth(QWIDGETSIZE_MAX);
+            canvas_->resize(vp_w, canvas_->height());
+        }
+    }
+    return QWidget::eventFilter(obj, event);
+}
+
+// ── Save / Restore layout via SettingsRepository ──────────────────────────────
+
+namespace {
+// Magic + version prefix for the serialized dashboard layout blob. Distinguishes
+// the current config-carrying format from the legacy one (which packed items
+// with no per-item config). `cols` (a small int) never collides with the magic,
+// so legacy blobs are still decoded (with empty per-item config).
+constexpr quint32 kDashLayoutMagic = 0xDA58A101u;
+constexpr quint32 kDashLayoutVersion = 1;
+
+/// Dynamic-property guard: set when restore_layout() could not *read* the
+/// stored blob (as opposed to reading a genuinely absent/corrupt one). While
+/// it is set, save_layout() refuses to write, because the layout on screen is
+/// the built-in default rather than anything the user arranged — persisting it
+/// would replace their real dashboard. Cleared by the next successful load.
+constexpr const char* kDashLayoutLoadFailedProp = "fincept_dash_layout_load_failed";
+} // namespace
+
+void DashboardScreen::save_layout() {
+    save_timer_->stop();
+
+    if (property(kDashLayoutLoadFailedProp).toBool()) {
+        LOG_WARN("Dashboard", "Skipping layout save — the stored layout could not be read this session, so the "
+                              "on-screen default must not overwrite it");
+        return;
+    }
+
+    GridLayout layout = canvas_->current_layout();
+
+    // Serialize: magic+version, cols, row_h, margin, item count, then each item
+    // (including its per-instance config — dropping it reverted every configured
+    // widget to defaults on restart).
+    QByteArray buf;
+    QDataStream stream(&buf, QIODevice::WriteOnly);
+    stream << kDashLayoutMagic << kDashLayoutVersion;
+    stream << layout.cols << layout.row_h << layout.margin;
+    stream << static_cast<int>(layout.items.size());
+    for (const auto& item : layout.items) {
+        stream << item.id << item.instance_id;
+        stream << item.cell.x << item.cell.y << item.cell.w << item.cell.h;
+        stream << item.cell.min_w << item.cell.min_h;
+        stream << QJsonDocument(item.config).toJson(QJsonDocument::Compact);
+    }
+
+    QString encoded = buf.toBase64();
+    (void)QtConcurrent::run(
+        [encoded]() { fincept::SettingsRepository::instance().set("dashboard_canvas_layout", encoded, "dashboard"); });
+}
+
+void DashboardScreen::restore_layout() {
+    QPointer<DashboardScreen> self = this;
+    (void)QtConcurrent::run([self]() {
+        auto result = fincept::SettingsRepository::instance().get("dashboard_canvas_layout");
+
+        QMetaObject::invokeMethod(
+            self,
+            [self, result]() {
+                if (!self)
+                    return;
+
+                if (result.is_err()) {
+                    LOG_ERROR("Dashboard",
+                              QString("settings read failed for 'dashboard_canvas_layout' — rendering the default "
+                                      "layout read-only, leaving the stored layout untouched: %1")
+                                  .arg(QString::fromStdString(result.error())));
+                    // Degrade read-only: the user still gets a usable dashboard,
+                    // but the layout_changed → save_timer_ → set() chain that
+                    // apply_template() is about to trigger is disarmed.
+                    self->setProperty(kDashLayoutLoadFailedProp, true);
+                    self->build_default_layout();
+
+                    // Say so. Suppressing the write stops the saved layout being
+                    // destroyed, but on its own it just swaps one silent failure
+                    // for another: the user sees a default dashboard, rearranges
+                    // it, and none of it persists — with only a LOG_WARN to
+                    // explain why. Reuse the toast this screen already owns.
+                    if (self->notif_toast_) {
+                        fincept::notifications::NotificationRecord rec;
+                        rec.request.title = tr("Dashboard layout unavailable");
+                        rec.request.message = tr("Your saved layout could not be read, so a default is shown. "
+                                                 "Changes will not be saved this session — restart to retry.");
+                        rec.request.level = fincept::notifications::NotifLevel::Warning;
+                        self->notif_toast_->show_notification(rec);
+                    }
+                    return;
+                }
+
+                // The read succeeded, so anything below this point is a genuine
+                // "unset or corrupt" case where writing the default back is the
+                // correct behaviour.
+                self->setProperty(kDashLayoutLoadFailedProp, false);
+
+                if (result.value().isEmpty()) {
+                    self->build_default_layout();
+                    return;
+                }
+
+                QByteArray payload = QByteArray::fromBase64(result.value().toUtf8());
+                QDataStream stream(&payload, QIODevice::ReadOnly);
+
+                GridLayout layout;
+                int count = 0;
+                // Detect the format: a leading magic means the config-carrying
+                // blob; otherwise the 4 bytes we read were the legacy `cols`.
+                quint32 lead = 0;
+                stream >> lead;
+                const bool has_config = (lead == kDashLayoutMagic);
+                if (has_config) {
+                    quint32 version = 0;
+                    stream >> version; // reserved for future migrations
+                    stream >> layout.cols >> layout.row_h >> layout.margin >> count;
+                } else {
+                    layout.cols = static_cast<int>(lead);
+                    stream >> layout.row_h >> layout.margin >> count;
+                }
+
+                if (count <= 0 || count > 100) {
+                    self->build_default_layout();
+                    return;
+                }
+
+                // Clamp the grid geometry before anything downstream uses it.
+                // A truncated / corrupted blob previously produced items with
+                // cols == 0 or w == 0, which grid_to_rect() turns into
+                // zero-width tiles and compact_vertical() spins over.
+                layout.cols = qBound(1, layout.cols, 48);
+                layout.row_h = qBound(10, layout.row_h, 400);
+                layout.margin = qBound(0, layout.margin, 64);
+
+                for (int i = 0; i < count; ++i) {
+                    GridItem item;
+                    stream >> item.id >> item.instance_id;
+                    stream >> item.cell.x >> item.cell.y >> item.cell.w >> item.cell.h;
+                    stream >> item.cell.min_w >> item.cell.min_h;
+                    if (has_config) {
+                        QByteArray cfg_bytes;
+                        stream >> cfg_bytes;
+                        const auto doc = QJsonDocument::fromJson(cfg_bytes);
+                        if (doc.isObject())
+                            item.config = doc.object();
+                    }
+                    // Stop at the first short read rather than appending
+                    // default-constructed garbage for the remaining items.
+                    if (stream.status() != QDataStream::Ok)
+                        break;
+                    if (item.id.isEmpty() || item.instance_id.isEmpty())
+                        continue;
+                    item.cell.min_w = qBound(1, item.cell.min_w, layout.cols);
+                    item.cell.min_h = qBound(1, item.cell.min_h, 64);
+                    item.cell.w = qBound(item.cell.min_w, item.cell.w, layout.cols);
+                    item.cell.h = qBound(item.cell.min_h, item.cell.h, 64);
+                    item.cell.x = qBound(0, item.cell.x, layout.cols - item.cell.w);
+                    item.cell.y = qBound(0, item.cell.y, 999);
+                    layout.items.append(item);
+                }
+
+                if (layout.items.isEmpty()) {
+                    self->build_default_layout();
+                    return;
+                }
+
+                self->canvas_->load_layout(layout);
+            },
+            Qt::QueuedConnection);
+    });
+}
+
+void DashboardScreen::build_default_layout() {
+    canvas_->apply_template("portfolio_manager");
+}
+
+} // namespace fincept::screens

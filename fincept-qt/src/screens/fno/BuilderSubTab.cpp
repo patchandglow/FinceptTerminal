@@ -1,0 +1,747 @@
+#include "screens/fno/BuilderSubTab.h"
+
+#include "core/logging/Logger.h"
+#include "datahub/DataHub.h"
+#include "datahub/DataHubMetaTypes.h"
+#include "screens/fno/BuilderAnalyticsRibbon.h"
+#include "screens/fno/LegEditorTable.h"
+#include "screens/fno/OrderConfirmDialog.h"
+#include "screens/fno/PayoffStripWidget.h"
+#include "screens/fno/TemplateToolbar.h"
+#include "services/options/OptionChainService.h"
+#include "services/options/StrategyAnalytics.h"
+#include "services/options/StrategyTemplates.h"
+#include "storage/repositories/StrategiesRepository.h"
+#include "trading/AccountManager.h"
+#include "trading/UnifiedTrading.h"
+#include "trading/instruments/InstrumentService.h"
+#include "ui/theme/StyleSheets.h"
+#include "ui/theme/Theme.h"
+
+#include <QHBoxLayout>
+#include <QHideEvent>
+#include <QInputDialog>
+#include <QLabel>
+#include <QMenu>
+#include <QMessageBox>
+#include <QPushButton>
+#include <QShowEvent>
+#include <QSpinBox>
+#include <QToolButton>
+#include <QVBoxLayout>
+
+#include <cmath>
+#include <exception>
+
+namespace fincept::screens::fno {
+
+namespace {
+
+/// ATM implied vol (decimal) for a chain snapshot, averaging the CE/PE pair on
+/// the ATM row. Returns 0 when the Greeks worker hasn't solved the row yet.
+///
+/// PayoffComputeOptions::fallback_iv defaults to a hard-coded 0.20 — leaving it
+/// there prices every leg that has no captured IV, *and* the whole probability-
+/// of-profit integral, at 20% vol regardless of the underlying. That is wildly
+/// wrong for BANKNIFTY (typically 2×) and equally wrong the other way for a
+/// low-vol index. Seed it from the live chain instead.
+double atm_iv_of(const fincept::services::options::OptionChain& chain) {
+    for (const auto& row : chain.rows) {
+        if (!row.is_atm)
+            continue;
+        if (row.ce_iv > 0 && row.pe_iv > 0)
+            return 0.5 * (row.ce_iv + row.pe_iv);
+        if (row.ce_iv > 0)
+            return row.ce_iv;
+        return row.pe_iv;
+    }
+    return 0.0;
+}
+
+/// Fill in any leg whose lot size the chain didn't carry (Fyers' options-chain
+/// endpoint omits it entirely, so `StrategyTemplates::instantiate` copies a 0).
+/// Without this a template-built strategy is un-tradable, and — before the
+/// Builder's pre-flight check existed — would have dispatched one *unit* per
+/// lot. All contracts on one underlying/expiry share a lot size, so a sibling
+/// lookup is authoritative.
+void backfill_lot_sizes(QVector<fincept::services::options::StrategyLeg>& legs,
+                        const fincept::services::options::OptionChain& chain) {
+    bool any_missing = false;
+    for (const auto& leg : legs)
+        if (leg.lot_size <= 0)
+            any_missing = true;
+    if (!any_missing || chain.broker_id.isEmpty())
+        return;
+
+    auto& insts = fincept::trading::InstrumentService::instance();
+    int shared_lot = 0;
+    const auto siblings =
+        insts.find_options_for_underlying(chain.broker_id, chain.underlying, chain.expiry, QStringLiteral("NFO"));
+    for (const auto& in : siblings) {
+        if (in.lot_size > 0) {
+            shared_lot = in.lot_size;
+            break;
+        }
+    }
+    for (auto& leg : legs) {
+        if (leg.lot_size > 0)
+            continue;
+        if (!leg.symbol.isEmpty()) {
+            if (auto inst = insts.find(leg.symbol, QStringLiteral("NFO"), chain.broker_id); inst && inst->lot_size > 0) {
+                leg.lot_size = inst->lot_size;
+                continue;
+            }
+        }
+        if (shared_lot > 0)
+            leg.lot_size = shared_lot;
+    }
+}
+
+} // namespace
+
+using fincept::services::options::OptionChain;
+using fincept::services::options::OptionChainService;
+using fincept::services::options::Strategy;
+using fincept::services::options::StrategyAnalytics;
+using fincept::services::options::StrategyInstantiationOptions;
+using fincept::services::options::StrategyLeg;
+using fincept::services::options::analytics::PayoffComputeOptions;
+using namespace fincept::ui;
+
+BuilderSubTab::BuilderSubTab(QWidget* parent) : QWidget(parent) {
+    setObjectName("fnoBuilderTab");
+    setStyleSheet(QString("#fnoBuilderTab { background:%1; }"
+                          "#fnoBldrFooter { background:%2; border-top:1px solid %3; }"
+                          "#fnoSaveBtn, #fnoLoadBtn { background:%2; color:%4; border:1px solid %3; "
+                          "  padding:5px 14px; font-size:10px; font-weight:700; letter-spacing:0.4px; }"
+                          "#fnoSaveBtn:hover, #fnoLoadBtn:hover { background:%5; }"
+                          "#fnoTradeBtn { background:%3; color:%6; border:none; padding:5px 14px; "
+                          "  font-size:10px; font-weight:700; letter-spacing:0.4px; }"
+                          "#fnoBldrOiLabel { color:%6; font-size:10px; font-weight:700; "
+                          "  letter-spacing:0.4px; background:transparent; }"
+                          "#fnoBldrOiValue { color:%4; font-size:10px; font-weight:700; background:transparent; }"
+                          "QToolButton::menu-indicator { width:14px; }")
+                      .arg(colors::BG_BASE(), colors::BG_RAISED(), colors::BORDER_DIM(), colors::TEXT_PRIMARY(),
+                           colors::BG_HOVER(), colors::TEXT_SECONDARY()));
+
+    setup_ui();
+    connect(toolbar_, &TemplateToolbar::template_chosen, this, &BuilderSubTab::on_template_chosen);
+    connect(toolbar_, &TemplateToolbar::add_leg_requested, this, [this]() {
+        // A +1-lot call at the chain's ATM strike, resolved from the live chain. The
+        // row used to be a strike-0 scratch leg with no way to edit its strike, so it
+        // distorted the payoff and could never be completed. Strike and Type are now
+        // editable in the table. A lot size the chain can't supply stays 0 - never
+        // defaulted to 1, which would have dispatched ONE UNIT for "1 lot"; the
+        // pre-flight check in on_trade_clicked() refuses such a row.
+        legs_view_->leg_model()->append_blank_leg();
+    });
+    connect(legs_view_->leg_model(), &LegEditorModel::legs_changed, this, &BuilderSubTab::on_legs_changed);
+    connect(save_btn_, &QPushButton::clicked, this, &BuilderSubTab::on_save_clicked);
+    connect(load_btn_, &QToolButton::clicked, this, &BuilderSubTab::on_load_clicked);
+    connect(trade_btn_, &QPushButton::clicked, this, &BuilderSubTab::on_trade_clicked);
+
+    connect(&OptionChainService::instance(), &OptionChainService::chain_published, this,
+            [this](const OptionChain& chain) {
+                last_chain_ = chain;
+                legs_view_->leg_model()->set_chain(chain);
+                if (pcr_label_)
+                    pcr_label_->setText(QString::number(chain.pcr, 'f', 2));
+                if (ce_oi_label_)
+                    ce_oi_label_->setText(QString::number(chain.total_ce_oi / 1000.0, 'f', 0) + "K");
+                if (pe_oi_label_)
+                    pe_oi_label_->setText(QString::number(chain.total_pe_oi / 1000.0, 'f', 0) + "K");
+                refresh_analytics();
+            });
+    chain_subscribed_ = true;
+
+    const auto& cached = OptionChainService::instance().last_chain();
+    if (!cached.rows.isEmpty()) {
+        last_chain_ = cached;
+        legs_view_->leg_model()->set_chain(cached);
+        refresh_analytics();
+    }
+}
+
+BuilderSubTab::~BuilderSubTab() {
+    fincept::datahub::DataHub::instance().unsubscribe(this);
+}
+
+void BuilderSubTab::setup_ui() {
+    auto* root = new QVBoxLayout(this);
+    root->setContentsMargins(0, 0, 0, 0);
+    root->setSpacing(0);
+
+    // Row 1: analytics ribbon (2 rows, ~44px)
+    ribbon_ = new BuilderAnalyticsRibbon(this);
+    root->addWidget(ribbon_);
+
+    // Row 2: template toolbar (28px)
+    toolbar_ = new TemplateToolbar(this);
+    root->addWidget(toolbar_);
+
+    // Row 3: leg editor (stretch)
+    legs_view_ = new LegEditorTable(this);
+    root->addWidget(legs_view_, 1);
+
+    // Row 4: payoff strip (fixed 80px)
+    chart_ = new PayoffStripWidget(this);
+    root->addWidget(chart_);
+
+    // Row 5: footer
+    auto* footer = new QWidget(this);
+    footer->setObjectName("fnoBldrFooter");
+    auto* foot_lay = new QHBoxLayout(footer);
+    foot_lay->setContentsMargins(8, 6, 8, 6);
+    foot_lay->setSpacing(8);
+
+    save_btn_ = new QPushButton(tr("SAVE"), footer);
+    save_btn_->setObjectName("fnoSaveBtn");
+    save_btn_->setCursor(Qt::PointingHandCursor);
+    foot_lay->addWidget(save_btn_);
+
+    load_btn_ = new QToolButton(footer);
+    load_btn_->setObjectName("fnoLoadBtn");
+    load_btn_->setText(tr("LOAD") + " \xe2\x96\xbe");
+    load_btn_->setCursor(Qt::PointingHandCursor);
+    load_btn_->setPopupMode(QToolButton::InstantPopup);
+    foot_lay->addWidget(load_btn_);
+
+    foot_lay->addSpacing(16);
+    target_label_ = new QLabel(tr("TARGET +"), footer);
+    target_label_->setObjectName("fnoBldrOiLabel");
+    days_to_target_spin_ = new QSpinBox(footer);
+    days_to_target_spin_->setRange(0, 365);
+    days_to_target_spin_->setValue(0);
+    days_to_target_spin_->setSuffix(" d");
+    days_to_target_spin_->setToolTip(tr("Days from today for the dashed target-day P/L curve. 0 = T+0."));
+    days_to_target_spin_->setStyleSheet(
+        QString("QSpinBox { background:%1; color:%2; border:1px solid %3; padding:2px 4px; "
+                "  font-size:11px; min-width:54px; }")
+            .arg(colors::BG_RAISED(), colors::TEXT_PRIMARY(), colors::BORDER_DIM()));
+    connect(days_to_target_spin_, QOverload<int>::of(&QSpinBox::valueChanged), this,
+            [this](int) { refresh_analytics(); });
+    foot_lay->addWidget(target_label_);
+    foot_lay->addWidget(days_to_target_spin_);
+
+    foot_lay->addStretch(1);
+
+    // PCR / OI labels on the right
+    pcr_key_ = new QLabel(tr("PCR"), footer);
+    pcr_key_->setObjectName("fnoBldrOiLabel");
+    pcr_label_ = new QLabel(QString::fromUtf8("—"), footer);
+    pcr_label_->setObjectName("fnoBldrOiValue");
+    foot_lay->addWidget(pcr_key_);
+    foot_lay->addWidget(pcr_label_);
+    foot_lay->addSpacing(8);
+
+    ce_key_ = new QLabel(tr("CE OI"), footer);
+    ce_key_->setObjectName("fnoBldrOiLabel");
+    ce_oi_label_ = new QLabel(QString::fromUtf8("—"), footer);
+    ce_oi_label_->setObjectName("fnoBldrOiValue");
+    foot_lay->addWidget(ce_key_);
+    foot_lay->addWidget(ce_oi_label_);
+    foot_lay->addSpacing(8);
+
+    pe_key_ = new QLabel(tr("PE OI"), footer);
+    pe_key_->setObjectName("fnoBldrOiLabel");
+    pe_oi_label_ = new QLabel(QString::fromUtf8("—"), footer);
+    pe_oi_label_->setObjectName("fnoBldrOiValue");
+    foot_lay->addWidget(pe_key_);
+    foot_lay->addWidget(pe_oi_label_);
+    foot_lay->addSpacing(16);
+
+    trade_btn_ = new QPushButton(tr("TRADE ALL (PAPER)"), footer);
+    trade_btn_->setObjectName("fnoTradeBtn");
+    trade_btn_->setEnabled(false);
+    trade_btn_->setToolTip(tr("Build a strategy first — Trade All needs at least one active leg."));
+    trade_btn_->setCursor(Qt::PointingHandCursor);
+    foot_lay->addWidget(trade_btn_);
+    root->addWidget(footer);
+
+    // ── Accessibility + keyboard traversal ────────────────────────────────
+    save_btn_->setAccessibleName(tr("Save strategy"));
+    load_btn_->setAccessibleName(tr("Load or delete a saved strategy"));
+    days_to_target_spin_->setAccessibleName(tr("Days to target date"));
+    trade_btn_->setAccessibleName(tr("Trade all active legs as paper orders"));
+    setTabOrder(toolbar_, legs_view_);
+    setTabOrder(legs_view_, save_btn_);
+    setTabOrder(save_btn_, load_btn_);
+    setTabOrder(load_btn_, days_to_target_spin_);
+    setTabOrder(days_to_target_spin_, trade_btn_);
+}
+
+QVariantMap BuilderSubTab::save_state() const {
+    QVariantMap m;
+    return m;
+}
+
+void BuilderSubTab::restore_state(const QVariantMap& state) {
+    Q_UNUSED(state);
+}
+
+void BuilderSubTab::showEvent(QShowEvent* e) {
+    QWidget::showEvent(e);
+    is_visible_ = true;
+    if (analytics_dirty_) {
+        analytics_dirty_ = false;
+        refresh_analytics();
+    }
+    if (chain_subscribed_)
+        return;
+    auto& hub = fincept::datahub::DataHub::instance();
+    QPointer<BuilderSubTab> self = this;
+    hub.subscribe_pattern(this, QStringLiteral("option:chain:*"), [self](const QString& topic, const QVariant& v) {
+        if (!self)
+            return;
+        self->on_chain_published(topic, v);
+    });
+    chain_subscribed_ = true;
+}
+
+void BuilderSubTab::hideEvent(QHideEvent* e) {
+    QWidget::hideEvent(e);
+    is_visible_ = false;
+}
+
+void BuilderSubTab::changeEvent(QEvent* event) {
+    if (event->type() == QEvent::LanguageChange)
+        retranslateUi();
+    QWidget::changeEvent(event);
+}
+
+void BuilderSubTab::retranslateUi() {
+    if (save_btn_)
+        save_btn_->setText(tr("SAVE"));
+    if (load_btn_)
+        load_btn_->setText(tr("LOAD") + " \xe2\x96\xbe");
+    if (target_label_)
+        target_label_->setText(tr("TARGET +"));
+    if (days_to_target_spin_)
+        days_to_target_spin_->setToolTip(tr("Days from today for the dashed target-day P/L curve. 0 = T+0."));
+    if (pcr_key_)
+        pcr_key_->setText(tr("PCR"));
+    if (ce_key_)
+        ce_key_->setText(tr("CE OI"));
+    if (pe_key_)
+        pe_key_->setText(tr("PE OI"));
+    // Re-applies the TRADE button text + its enabled/tooltip state.
+    if (trade_btn_)
+        trade_btn_->setText(tr("TRADE ALL (PAPER)"));
+    update_trade_button_state();
+}
+
+void BuilderSubTab::on_chain_published(const QString& topic, const QVariant& v) {
+    Q_UNUSED(topic);
+    if (!v.canConvert<OptionChain>())
+        return;
+    last_chain_ = v.value<OptionChain>();
+    legs_view_->leg_model()->set_chain(last_chain_);
+    if (pcr_label_)
+        pcr_label_->setText(QString::number(last_chain_.pcr, 'f', 2));
+    if (ce_oi_label_)
+        ce_oi_label_->setText(QString::number(last_chain_.total_ce_oi / 1000.0, 'f', 0) + "K");
+    if (pe_oi_label_)
+        pe_oi_label_->setText(QString::number(last_chain_.total_pe_oi / 1000.0, 'f', 0) + "K");
+    refresh_analytics();
+}
+
+void BuilderSubTab::on_template_chosen(const QString& template_id, const StrategyInstantiationOptions& options) {
+    if (last_chain_.rows.isEmpty()) {
+        QMessageBox::information(this, tr("No chain yet"),
+                                 tr("Open the Chain tab first so a chain snapshot is loaded."));
+        return;
+    }
+    const auto* tpl = fincept::services::options::find(template_id);
+    if (!tpl) {
+        LOG_WARN("FnoBuilder", QString("Unknown template id: %1").arg(template_id));
+        return;
+    }
+    auto r = fincept::services::options::instantiate(*tpl, last_chain_, options);
+    if (r.is_err()) {
+        QMessageBox::warning(this, tr("Could not build strategy"), QString::fromStdString(r.error()));
+        return;
+    }
+    auto legs = r.value().legs;
+    backfill_lot_sizes(legs, last_chain_);
+    legs_view_->leg_model()->set_legs(legs);
+    loaded_strategy_id_ = 0;
+    loaded_strategy_name_.clear();
+    refresh_analytics();
+}
+
+void BuilderSubTab::on_legs_changed() {
+    refresh_analytics();
+}
+
+Strategy BuilderSubTab::current_strategy() const {
+    Strategy s;
+    s.legs = legs_view_->leg_model()->legs();
+    s.underlying = last_chain_.underlying;
+    s.expiry = last_chain_.expiry;
+    s.created = QDateTime::currentDateTime();
+    s.modified = s.created;
+    s.name = loaded_strategy_name_.isEmpty() ? tr("Custom") : loaded_strategy_name_;
+    return s;
+}
+
+void BuilderSubTab::refresh_analytics() {
+    // Deferred while hidden — showEvent replays it. Keeps a background tab from
+    // running the full payoff + POP integral on every chain publish.
+    if (!is_visible_) {
+        analytics_dirty_ = true;
+        update_trade_button_state();
+        return;
+    }
+    const auto& legs = legs_view_->leg_model()->legs();
+    if (legs.isEmpty() || last_chain_.rows.isEmpty()) {
+        ribbon_->clear();
+        chart_->clear_payoff();
+        update_trade_button_state();
+        return;
+    }
+    Strategy s = current_strategy();
+
+    PayoffComputeOptions opts;
+    opts.current_spot = last_chain_.spot;
+    opts.days_to_target = days_to_target_spin_ ? days_to_target_spin_->value() : 0;
+    opts.risk_free_rate = OptionChainService::instance().risk_free_rate_for(last_chain_.broker_id);
+    if (const double atm_iv = atm_iv_of(last_chain_); atm_iv > 0)
+        opts.fallback_iv = atm_iv;
+
+    auto curve = fincept::services::options::analytics::compute_payoff(s, opts);
+    auto bes = fincept::services::options::analytics::compute_breakevens(curve);
+    auto a = fincept::services::options::analytics::compute_all(s, last_chain_, opts);
+
+    chart_->set_payoff(curve, last_chain_.spot, bes);
+    ribbon_->update_from(s, a);
+    update_trade_button_state();
+}
+
+void BuilderSubTab::update_trade_button_state() {
+    const auto& legs = legs_view_->leg_model()->legs();
+    int active = 0;
+    for (const auto& l : legs)
+        if (l.is_active && l.lots != 0)
+            ++active;
+    const bool ok = active > 0 && !last_chain_.rows.isEmpty();
+    trade_btn_->setEnabled(ok);
+    trade_btn_->setToolTip(ok ? tr("Place all active legs as paper orders.")
+                              : tr("Build a strategy first — Trade All needs at least one active leg."));
+}
+
+namespace {
+// Resolve the trading account for the chain's broker so Builder strategy trades
+// land in the SAME paper portfolio as the chain's right-click Buy/Sell (one
+// unified F&O blotter), rather than a disconnected standalone "F&O Paper"
+// portfolio. Prefer an active account, else the first configured one. Mirrors
+// ChainSubTab::find_account_for_broker.
+QString find_account_for_broker(const QString& broker_id) {
+    auto accounts = fincept::trading::AccountManager::instance().list_accounts(broker_id);
+    for (const auto& acct : accounts)
+        if (acct.is_active)
+            return acct.account_id;
+    return accounts.isEmpty() ? QString{} : accounts[0].account_id;
+}
+
+// Contract identity for a PAPER order, mirroring ChainSubTab::on_order_requested so a
+// Builder basket and a right-click Buy/Sell on the same strike land on ONE position.
+// The paper layer keys positions by the BARE broker symbol (no "NSE:"/"NFO:" exchange
+// prefix, no -CE/-PE segment suffix): that is the key the live quote feed publishes
+// under, so a prefixed symbol never marks to market and never nets with the chain's
+// positions. Fyers chain legs carry the native "NSE:..." spelling, which is what
+// leg.symbol held here before.
+struct FnoBuilderPaperContract {
+    QString symbol;
+    QString exchange;
+};
+
+FnoBuilderPaperContract fno_builder_paper_contract(const QString& broker_id, const QString& leg_symbol) {
+    FnoBuilderPaperContract pc{leg_symbol, QStringLiteral("NFO")};
+    if (auto inst = fincept::trading::InstrumentService::instance().find(leg_symbol, QStringLiteral("NFO"), broker_id)) {
+        if (!inst->brsymbol.isEmpty())
+            pc.symbol = inst->brsymbol;
+        if (!inst->brexchange.isEmpty())
+            pc.exchange = inst->brexchange;
+    }
+    if (const int c = pc.symbol.indexOf(QLatin1Char(':')); c >= 0)
+        pc.symbol = pc.symbol.mid(c + 1);
+    for (const auto& suf :
+         {QStringLiteral("-CE"), QStringLiteral("-PE"), QStringLiteral("-FUT"), QStringLiteral("-EQ")}) {
+        if (pc.symbol.endsWith(suf)) {
+            pc.symbol.chop(int(suf.size()));
+            break;
+        }
+    }
+    return pc;
+}
+} // namespace
+
+void BuilderSubTab::on_trade_clicked() {
+    using namespace fincept::trading;
+    const auto& legs = legs_view_->leg_model()->legs();
+    if (legs.isEmpty() || last_chain_.rows.isEmpty())
+        return;
+    Strategy s = current_strategy();
+
+    // ── Pre-flight contract validation (money-loss guard) ────────────────────
+    // A leg reaches the basket from three places: the chain's left-click (fully
+    // resolved), a template instantiation, and TemplateToolbar's "+ ADD LEG"
+    // (a blank leg with lot_size = 1 and no symbol). Submitting the blank one
+    // sends quantity = |lots| × 1 — a ONE UNIT order where the user asked for
+    // one lot — and an empty symbol the broker will either reject or, worse,
+    // mis-route. Refuse the whole basket instead of silently placing part of it.
+    QStringList invalid;
+    int placeable = 0;
+    for (const auto& leg : legs) {
+        if (!leg.is_active || leg.lots == 0)
+            continue;
+        ++placeable;
+        const QString label = leg.symbol.isEmpty()
+                                  ? tr("row %1 (%2)").arg(placeable).arg(leg.strike, 0, 'f', 0)
+                                  : leg.symbol;
+        if (leg.symbol.isEmpty())
+            invalid.append(tr("%1 — no contract symbol").arg(label));
+        else if (leg.lot_size <= 0)
+            invalid.append(tr("%1 — lot size not resolved").arg(label));
+        else if (leg.type != fincept::trading::InstrumentType::CE &&
+                 leg.type != fincept::trading::InstrumentType::PE && leg.type != fincept::trading::InstrumentType::FUT)
+            invalid.append(tr("%1 — instrument type not set").arg(label));
+    }
+    if (placeable == 0) {
+        QMessageBox::information(this, tr("Nothing to trade"),
+                                 tr("Switch on at least one leg with a non-zero lot count."));
+        return;
+    }
+    if (!invalid.isEmpty()) {
+        QMessageBox::warning(
+            this, tr("Cannot trade this strategy"),
+            tr("These legs are not fully resolved, so the order quantity would be wrong:\n\n%1\n\n"
+               "Add legs by clicking a premium in the Chain tab (or use a template) so the contract "
+               "symbol and lot size come from the live chain.")
+                .arg(invalid.join("\n")));
+        return;
+    }
+
+    fincept::services::options::analytics::PayoffComputeOptions opts;
+    opts.current_spot = last_chain_.spot;
+    opts.risk_free_rate = OptionChainService::instance().risk_free_rate_for(last_chain_.broker_id);
+    if (const double atm_iv = atm_iv_of(last_chain_); atm_iv > 0)
+        opts.fallback_iv = atm_iv;
+    auto a = fincept::services::options::analytics::compute_all(s, last_chain_, opts);
+
+    // Double-submit guard: the dispatch loop below is synchronous, but the
+    // confirm dialog spins a nested event loop and the button stays live under
+    // it on some styles. Disable for the whole ticket lifetime.
+    if (trade_btn_)
+        trade_btn_->setEnabled(false);
+    struct ReenableGuard {
+        QPushButton* btn;
+        BuilderSubTab* owner;
+        ~ReenableGuard() {
+            if (btn && owner)
+                owner->update_trade_button_state();
+        }
+    } reenable{trade_btn_, this};
+
+    OrderConfirmDialog dlg(s, last_chain_, a.premium_paid, a.max_profit, a.max_loss, this);
+    if (dlg.exec() != QDialog::Accepted)
+        return;
+
+    if (auto m = dlg.basket_margin(); m.has_value()) {
+        const double val = m->final_margin > 0 ? m->final_margin : m->initial_margin;
+        ribbon_->set_margin(val, /*estimated*/ false);
+    }
+
+    // Route every leg through the account-aware UnifiedTrading path (identical to
+    // the chain's right-click Buy/Sell). For paper this fills market orders
+    // immediately at the current premium, tags the position with its product
+    // (NRML), stores the bare symbol so it marks to market, and keeps every F&O
+    // paper position in ONE account portfolio so square-off and the shared
+    // blotter can see them. Previously each leg was a raw "limit" order that was
+    // never filled and lived in a separate portfolio nothing else could reach.
+    const QString broker = last_chain_.broker_id;
+    const QString account_id = find_account_for_broker(broker);
+    if (account_id.isEmpty()) {
+        QMessageBox::warning(this, tr("Trade Strategy"),
+                             tr("No connected %1 account. Connect one in Equity Trading to paper-trade this strategy.")
+                                 .arg(broker.isEmpty() ? tr("trading") : broker));
+        return;
+    }
+
+    // SAFETY (money-loss guard): this action is paper-only — the button, tooltip,
+    // confirm dialog and toast all say "paper", and it fills every leg as a
+    // market order at the current premium. UnifiedTrading::place_order routes by
+    // the account's real trading_mode, so if the resolved account is LIVE this
+    // would fire real broker orders while the entire UI claims "paper". Refuse
+    // instead. (Live F&O trading is done per-leg from the option chain's
+    // right-click Buy/Sell, which maps the broker-native symbol, confirms LIVE
+    // explicitly, and places off the UI thread.)
+    const BrokerAccount acct = AccountManager::instance().get_account(account_id);
+    if (acct.trading_mode == QStringLiteral("live")) {
+        QMessageBox::warning(
+            this, tr("Paper trade only"),
+            tr("The %1 account is in LIVE mode.\n\n“Trade All (Paper)” only places simulated paper orders — it will "
+               "not place live orders. To trade this strategy live, place each leg from the option chain "
+               "(right-click a strike → Buy / Sell), which confirms each live order individually.")
+                .arg(acct.display_name.isEmpty() ? broker : acct.display_name));
+        return;
+    }
+
+    int placed = 0;
+    int failed = 0;
+    QStringList failures;
+    for (const auto& leg : legs) {
+        if (!leg.is_active || leg.lots == 0)
+            continue;
+        UnifiedOrder order;
+        const auto contract = fno_builder_paper_contract(broker, leg.symbol);
+        order.symbol = contract.symbol;
+        order.exchange = contract.exchange;
+        order.side = leg.lots > 0 ? OrderSide::Buy : OrderSide::Sell;
+        order.order_type = OrderType::Market; // paper: execute the strategy at current premiums
+        order.quantity = std::abs(double(leg.lots) * double(leg.lot_size));
+        order.price = leg.entry_price;            // current leg premium → paper fill price
+        order.product_type = ProductType::Margin; // NRML (positional) for F&O
+        order.validity = QStringLiteral("DAY");
+        auto resp = UnifiedTrading::instance().place_order(account_id, order);
+        if (resp.success) {
+            ++placed;
+        } else {
+            ++failed;
+            failures.append(QString("%1: %2").arg(leg.symbol, resp.message));
+        }
+    }
+
+    QString msg;
+    if (failed == 0) {
+        msg = tr("Placed %1 paper orders for %2 (%3).").arg(placed).arg(s.underlying, s.expiry);
+    } else {
+        msg = tr("Placed %1 of %2 paper orders. %3 failed:\n%4")
+                  .arg(placed)
+                  .arg(placed + failed)
+                  .arg(failed)
+                  .arg(failures.join("\n"));
+    }
+    LOG_INFO("FnoBuilder", msg.split('\n').first());
+    QMessageBox::information(this, tr("Paper orders dispatched"), msg);
+}
+
+void BuilderSubTab::on_save_clicked() {
+    const auto& legs = legs_view_->leg_model()->legs();
+    if (legs.isEmpty()) {
+        QMessageBox::information(this, tr("Nothing to save"), tr("Build a strategy first."));
+        return;
+    }
+
+    auto& repo = fincept::StrategiesRepository::instance();
+    if (loaded_strategy_id_ != 0) {
+        Strategy s = current_strategy();
+        s.name = loaded_strategy_name_.isEmpty() ? tr("Custom") : loaded_strategy_name_;
+        auto r = repo.update(loaded_strategy_id_, s);
+        if (r.is_err()) {
+            QMessageBox::warning(this, tr("Save failed"), QString::fromStdString(r.error()));
+            return;
+        }
+        LOG_INFO("FnoBuilder", QString("Updated strategy '%1' (id=%2)").arg(s.name).arg(loaded_strategy_id_));
+        return;
+    }
+
+    bool ok = false;
+    const QString name =
+        QInputDialog::getText(this, tr("Save strategy"), tr("Name"), QLineEdit::Normal, tr("My strategy"), &ok);
+    if (!ok || name.trimmed().isEmpty())
+        return;
+    Strategy s = current_strategy();
+    s.name = name.trimmed();
+    auto r = repo.save(s);
+    if (r.is_err()) {
+        QMessageBox::warning(this, tr("Save failed"), QString::fromStdString(r.error()));
+        return;
+    }
+    loaded_strategy_id_ = r.value();
+    loaded_strategy_name_ = s.name;
+    LOG_INFO("FnoBuilder", QString("Saved new strategy '%1' (id=%2)").arg(s.name).arg(r.value()));
+}
+
+void BuilderSubTab::on_load_clicked() {
+    auto* menu = new QMenu(this);
+    auto rows_r = fincept::StrategiesRepository::instance().list_all();
+    if (rows_r.is_err() || rows_r.value().isEmpty()) {
+        auto* a = menu->addAction(tr("(no saved strategies)"));
+        a->setEnabled(false);
+    } else {
+        for (const auto& row : rows_r.value()) {
+            QString label = row.strategy.name;
+            if (!row.strategy.underlying.isEmpty())
+                label += "  —  " + row.strategy.underlying;
+            if (row.strategy.modified.isValid()) {
+                const QString iso = row.strategy.modified.toString("yyyy-MM-dd HH:mm");
+                label += "    [" + iso + "]";
+            }
+            auto* act = menu->addAction(label);
+            const qint64 id = row.id;
+            const QString name_for_msg = row.strategy.name;
+            connect(act, &QAction::triggered, this, [this, id, name_for_msg]() {
+                auto r = fincept::StrategiesRepository::instance().get(id);
+                if (r.is_err()) {
+                    QMessageBox::warning(this, tr("Load failed"), QString::fromStdString(r.error()));
+                    return;
+                }
+                // A strategy saved in an earlier session can carry lot_size 0 if
+                // the provider omitted it then. Re-resolve against today's
+                // instrument master before it reaches the leg table.
+                auto loaded_legs = r.value().strategy.legs;
+                backfill_lot_sizes(loaded_legs, last_chain_);
+                legs_view_->leg_model()->set_legs(loaded_legs);
+                loaded_strategy_id_ = id;
+                loaded_strategy_name_ = name_for_msg;
+                refresh_analytics();
+                LOG_INFO("FnoBuilder", QString("Loaded strategy '%1' (id=%2)").arg(name_for_msg).arg(id));
+
+                // Live LTP / Greeks / spot / payoff bounds come from the chain the Chain
+                // tab is showing, matched to legs by strike. A strategy saved for another
+                // underlying or expiry therefore renders confident-looking numbers that
+                // belong to a different instrument — say so instead of staying silent.
+                const QString saved_under = r.value().strategy.underlying;
+                QString saved_exp;
+                for (const auto& l : loaded_legs)
+                    if (!l.expiry.isEmpty()) {
+                        saved_exp = l.expiry;
+                        break;
+                    }
+                const bool under_differs =
+                    !saved_under.isEmpty() && !last_chain_.underlying.isEmpty() && saved_under != last_chain_.underlying;
+                const bool exp_differs =
+                    !saved_exp.isEmpty() && !last_chain_.expiry.isEmpty() && saved_exp != last_chain_.expiry;
+                if (under_differs || exp_differs) {
+                    QMessageBox::warning(
+                        this, tr("Strategy is for a different chain"),
+                        tr("'%1' was saved for %2 %3, but the Chain tab is showing %4 %5.\n\n"
+                           "Live premiums, Greeks, spot and the payoff range come from the chain on screen, so "
+                           "they will not match these legs. Open the matching underlying and expiry in the Chain "
+                           "tab to see correct figures.")
+                            .arg(name_for_msg, saved_under.isEmpty() ? tr("?") : saved_under,
+                                 saved_exp.isEmpty() ? tr("?") : saved_exp, last_chain_.underlying, last_chain_.expiry));
+                }
+            });
+        }
+        menu->addSeparator();
+        for (const auto& row : rows_r.value()) {
+            auto* del = menu->addAction(tr("Delete: %1").arg(row.strategy.name));
+            const qint64 id = row.id;
+            const QString name = row.strategy.name;
+            connect(del, &QAction::triggered, this, [this, id, name]() {
+                const auto choice = QMessageBox::question(this, tr("Delete saved strategy"),
+                                                          tr("Delete '%1'? This can't be undone.").arg(name),
+                                                          QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+                if (choice != QMessageBox::Yes)
+                    return;
+                fincept::StrategiesRepository::instance().remove(id);
+            });
+        }
+    }
+    menu->exec(load_btn_->mapToGlobal(QPoint(0, load_btn_->height())));
+    menu->deleteLater();
+}
+
+} // namespace fincept::screens::fno

@@ -1,0 +1,666 @@
+// src/screens/report_builder/ReportBuilderScreen_Dialogs.cpp
+//
+// Modal dialogs (Recent / Template / Theme / Metadata) + the file-action
+// slots (on_new / on_open / on_save / on_export_pdf / on_preview).
+//
+// Part of the partial-class split of ReportBuilderScreen.cpp.
+
+#include "core/logging/Logger.h"
+#include "core/session/ScreenStateManager.h"
+#include "datahub/DataHub.h"
+#include "datahub/DataHubMetaTypes.h"
+#include "screens/report_builder/ReportBuilderScreen.h"
+#include "services/file_manager/FileManagerService.h"
+#include "services/markets/MarketDataService.h"
+#include "services/report_builder/ReportBuilderService.h"
+#include "ui/theme/Theme.h"
+
+#include <QComboBox>
+#include <QDateTime>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QFileDialog>
+#include <QFileInfo>
+#include <QFormLayout>
+#include <QFrame>
+#include <QHBoxLayout>
+#include <QHideEvent>
+#include <QLabel>
+#include <QLineEdit>
+#include <QListWidget>
+#include <QListWidgetItem>
+#include <QMessageBox>
+#include <QAbstractTextDocumentLayout>
+#include <QPageLayout>
+#include <QPageSize>
+#include <QPainter>
+#include <QPointer>
+#include <QPrintPreviewDialog>
+#include <QPrinter>
+#include <QPropertyAnimation>
+#include <QPushButton>
+#include <QShowEvent>
+#include <QTextDocument>
+#include <QTextFrame>
+#include <QVBoxLayout>
+
+#include <algorithm>
+
+namespace fincept::screens {
+
+namespace rep = ::fincept::report;
+using Service = ::fincept::services::ReportBuilderService;
+
+void ReportBuilderScreen::show_recent_dialog() {
+    // Opening a recent report replaces the document, same as File → Open.
+    if (!confirm_replace_document(tr("Recent Reports")))
+        return;
+    QStringList recent = Service::instance().recent_files();
+
+    auto* dlg = new QDialog(this);
+    dlg->setWindowTitle(tr("Recent Reports"));
+    dlg->setMinimumWidth(500);
+    dlg->setStyleSheet(QString("QDialog { background: %1; color: %2; }"
+                               "QListWidget { background: %3; color: %2; border: 1px solid %4; }"
+                               "QListWidget::item { padding: 6px; }"
+                               "QListWidget::item:selected { background: %5; }"
+                               "QPushButton { background: %3; color: %2; border: 1px solid %4; padding: 6px 16px; }"
+                               "QPushButton:hover { background: %5; }")
+                           .arg(ui::colors::DARK(), ui::colors::WHITE(), ui::colors::PANEL(), ui::colors::BORDER(),
+                                ui::colors::BG_RAISED()));
+
+    auto* vl = new QVBoxLayout(dlg);
+    auto* lbl = new QLabel(tr("Select a report to open:"));
+    lbl->setStyleSheet(QString("color: %1;").arg(ui::colors::MUTED()));
+    vl->addWidget(lbl);
+
+    auto* list = new QListWidget;
+    if (recent.isEmpty()) {
+        list->addItem(tr("(No recent reports)"));
+    } else {
+        list->addItems(recent);
+    }
+    vl->addWidget(list, 1);
+
+    auto* bb = new QDialogButtonBox(QDialogButtonBox::Open | QDialogButtonBox::Cancel);
+    vl->addWidget(bb);
+
+    auto open_selected = [list, recent, dlg, this]() {
+        int row = list->currentRow();
+        if (row >= 0 && row < recent.size()) {
+            auto r = Service::instance().load_from(recent[row]);
+            if (r.is_err())
+                QMessageBox::warning(
+                    this, tr("Open Report"),
+                    tr("Could not open file:\n%1\n\n%2").arg(recent[row], QString::fromStdString(r.error())));
+        }
+        dlg->accept();
+    };
+
+    connect(bb, &QDialogButtonBox::accepted, dlg, open_selected);
+    connect(bb, &QDialogButtonBox::rejected, dlg, &QDialog::reject);
+    connect(list, &QListWidget::itemDoubleClicked, dlg, [open_selected](QListWidgetItem*) { open_selected(); });
+
+    dlg->exec();
+    dlg->deleteLater();
+}
+
+void ReportBuilderScreen::show_template_dialog() {
+    // Applying a template replaces the whole document and clears the undo stack (it goes
+    // through replace_document), so — unlike New/Open/Recent, which ask — it used to wipe
+    // unsaved work with no warning and no way back.
+    if (!confirm_replace_document(tr("Report Templates")))
+        return;
+
+    struct TemplateEntry {
+        QString name;
+        QString description;
+    };
+    struct Category {
+        QString label;
+        QVector<TemplateEntry> entries;
+    };
+
+    // Template names (TemplateEntry::name) are stable lookup keys passed to
+    // apply_template() — left untranslated. Category labels and descriptions are
+    // display-only and localized.
+    const QVector<Category> categories = {
+        {tr("General Purpose"),
+         {{"Blank Report", tr("Empty document with title and date — start from scratch.")},
+          {"Meeting Notes", tr("Agenda, attendees, discussion points, action items, next steps.")},
+          {"Investment Memo", tr("Executive summary, thesis, opportunity, risks, recommendation.")}}},
+        {tr("Retail Investor"),
+         {{"Stock Research", tr("Company overview, financials, valuation, thesis, and risks.")},
+          {"Portfolio Review", tr("Holdings, performance, allocation pie, risk metrics, notes.")},
+          {"Watchlist Report", tr("Tracked tickers with price, change, target, and notes columns.")},
+          {"Dividend Income Report", tr("Dividend stocks table, yield chart, income projection, calendar.")}}},
+        {tr("Trader"),
+         {{"Daily Market Brief", tr("Indices snapshot, top movers, news highlights, watchlist.")},
+          {"Trade Journal", tr("Trade log table, P&L chart, win rate stats, lessons learned.")},
+          {"Technical Analysis", tr("Price chart placeholder, indicators table, S/R levels, setup.")},
+          {"Pre-Market Checklist", tr("Macro events, key levels, planned trades, risk per trade.")}}},
+        {tr("Institutional / Analyst"),
+         {{"Equity Research Report", tr("Full buy-side template: overview, financials, DCF, comparables.")},
+          {"Earnings Review", tr("Revenue/EPS vs estimates, guidance, segment breakdown, outlook.")},
+          {"M&A Deal Summary", tr("Deal overview, rationale, comparables, synergies, valuation.")},
+          {"Sector Deep Dive", tr("Sector overview, sub-industries, key players, trends, risks.")}}},
+        {tr("Economist / Macro"),
+         {{"Macro Economic Summary", tr("GDP, inflation, unemployment, central bank policy, outlook.")},
+          {"Country Risk Report", tr("Political, economic, financial, market risk tables and charts.")},
+          {"Central Bank Monitor", tr("Rate decisions, forward guidance, balance sheet, implications.")}}},
+        {tr("Crypto / Digital Assets"),
+         {{"Crypto Research Report", tr("Project overview, tokenomics, on-chain metrics, price chart.")},
+          {"DeFi Protocol Analysis", tr("Protocol overview, TVL, revenue, risks, token valuation.")},
+          {"Crypto Portfolio Review", tr("Holdings, allocation, cost basis table, P&L, risk exposure.")}}},
+        {tr("Fixed Income"),
+         {{"Bond Research Report", tr("Issuer overview, credit profile, yield analysis, recommendation.")},
+          {"Yield Curve Analysis", tr("Curve chart, spread table, duration/convexity, macro drivers.")}}},
+        {tr("Quant / Risk"),
+         {{"Quant Strategy Report", tr("Strategy description, backtest results, stats, drawdown chart.")},
+          {"Risk Management Report", tr("VaR, CVaR, stress tests, correlation matrix, recommendations.")}}},
+        {tr("Corporate / Business"),
+         {{"Business Performance", tr("KPI dashboard, revenue chart, cost breakdown, targets vs actual.")},
+          {"Project Status Report", tr("Objectives, milestones table, status, risks, next actions.")},
+          {"Financial Statement", tr("Income statement, balance sheet, cash flow tables.")}}},
+    };
+
+    auto* dlg = new QDialog(this);
+    dlg->setWindowTitle(tr("Report Templates"));
+    dlg->setMinimumSize(680, 520);
+    dlg->setStyleSheet(QString("QDialog    { background: %1; color: %2; }"
+                               "QListWidget { background: %3; color: %2; border: 1px solid %4; }"
+                               "QListWidget::item { padding: 6px 8px; font-size: 12px; }"
+                               "QListWidget::item:selected { background: %5; color: %6; }"
+                               "QPushButton { background: %3; color: %2; border: 1px solid %4; padding: 6px 16px; }"
+                               "QPushButton:hover { background: %5; }"
+                               "QLabel { background: transparent; }")
+                           .arg(ui::colors::DARK(), ui::colors::WHITE(), ui::colors::PANEL(), ui::colors::BORDER(),
+                                ui::colors::AMBER_DIM(), ui::colors::AMBER()));
+
+    auto* hl = new QHBoxLayout(dlg);
+    hl->setSpacing(0);
+    hl->setContentsMargins(0, 0, 0, 0);
+
+    auto* left = new QWidget(this);
+    left->setMinimumWidth(280);
+    auto* lvl = new QVBoxLayout(left);
+    lvl->setContentsMargins(12, 12, 8, 12);
+    lvl->setSpacing(6);
+
+    auto* pick_lbl = new QLabel(tr("Choose a template:"));
+    pick_lbl->setStyleSheet(QString("color: %1; font-size: 12px; font-weight: bold;").arg(ui::colors::MUTED()));
+    lvl->addWidget(pick_lbl);
+
+    auto* list = new QListWidget;
+    list->setSpacing(1);
+    for (const auto& cat : categories) {
+        auto* cat_item = new QListWidgetItem("  " + cat.label.toUpper());
+        cat_item->setFlags(Qt::NoItemFlags);
+        cat_item->setForeground(QColor(ui::colors::AMBER()));
+        QFont f = cat_item->font();
+        f.setBold(true);
+        f.setPointSize(10);
+        cat_item->setFont(f);
+        cat_item->setBackground(QColor(ui::colors::BG_RAISED()));
+        list->addItem(cat_item);
+        for (const auto& tmpl : cat.entries) {
+            auto* item = new QListWidgetItem("    " + tmpl.name);
+            item->setData(Qt::UserRole, tmpl.name);
+            item->setData(Qt::UserRole + 1, tmpl.description);
+            list->addItem(item);
+        }
+    }
+    lvl->addWidget(list, 1);
+    hl->addWidget(left);
+
+    auto* sep = new QFrame;
+    sep->setFixedWidth(1);
+    sep->setStyleSheet(QString("background: %1;").arg(ui::colors::BORDER()));
+    hl->addWidget(sep);
+
+    auto* right = new QWidget(this);
+    right->setMinimumWidth(280);
+    auto* rvl = new QVBoxLayout(right);
+    rvl->setContentsMargins(12, 12, 12, 12);
+    rvl->setSpacing(8);
+
+    auto* tmpl_name_lbl = new QLabel(tr("Select a template"));
+    tmpl_name_lbl->setStyleSheet(QString("color: %1; font-size: 14px; font-weight: bold;").arg(ui::colors::AMBER()));
+    tmpl_name_lbl->setWordWrap(true);
+    rvl->addWidget(tmpl_name_lbl);
+
+    auto* desc_lbl = new QLabel(tr("Pick a template from the list to see a description."));
+    desc_lbl->setWordWrap(true);
+    desc_lbl->setAlignment(Qt::AlignTop | Qt::AlignLeft);
+    desc_lbl->setStyleSheet(QString("color: %1; font-size: 12px; line-height: 160%;").arg(ui::colors::GRAY()));
+    rvl->addWidget(desc_lbl, 1);
+
+    auto* bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    rvl->addWidget(bb);
+    hl->addWidget(right);
+
+    connect(list, &QListWidget::currentItemChanged, this,
+            [tmpl_name_lbl, desc_lbl](QListWidgetItem* cur, QListWidgetItem*) {
+                if (!cur || !(cur->flags() & Qt::ItemIsSelectable))
+                    return;
+                tmpl_name_lbl->setText(cur->data(Qt::UserRole).toString());
+                desc_lbl->setText(cur->data(Qt::UserRole + 1).toString());
+            });
+
+    auto apply_selected = [list, dlg]() {
+        auto* cur = list->currentItem();
+        if (!cur || !(cur->flags() & Qt::ItemIsSelectable))
+            return;
+        QString tname = cur->data(Qt::UserRole).toString();
+        if (!tname.isEmpty())
+            Service::instance().apply_template(tname);
+        dlg->accept();
+    };
+
+    connect(list, &QListWidget::itemDoubleClicked, dlg, [apply_selected](QListWidgetItem*) { apply_selected(); });
+    connect(bb, &QDialogButtonBox::accepted, dlg, apply_selected);
+    connect(bb, &QDialogButtonBox::rejected, dlg, &QDialog::reject);
+
+    dlg->exec();
+    dlg->deleteLater();
+}
+
+void ReportBuilderScreen::show_theme_dialog() {
+    const QStringList theme_names = rep::themes::all_names();
+
+    auto* dlg = new QDialog(this);
+    dlg->setWindowTitle(tr("Report Theme"));
+    dlg->setMinimumWidth(380);
+    dlg->setStyleSheet(
+        QString("QDialog { background: %1; color: %2; }"
+                "QComboBox, QPushButton { background: %3; color: %2; border: 1px solid %4; padding: 4px 8px; }"
+                "QLabel { background: transparent; color: %2; }")
+            .arg(ui::colors::DARK(), ui::colors::WHITE(), ui::colors::PANEL(), ui::colors::BORDER()));
+
+    auto* vl = new QVBoxLayout(dlg);
+    vl->addWidget(new QLabel(tr("Select a color theme for your report:")));
+
+    auto* combo = new QComboBox;
+    for (const auto& n : theme_names)
+        combo->addItem(n);
+    const QString current = Service::instance().theme().name;
+    int cur_idx = theme_names.indexOf(current);
+    if (cur_idx >= 0)
+        combo->setCurrentIndex(cur_idx);
+    vl->addWidget(combo);
+
+    auto* preview_lbl = new QLabel;
+    preview_lbl->setFixedHeight(40);
+    preview_lbl->setAlignment(Qt::AlignCenter);
+    auto update_preview = [preview_lbl, theme_names](int idx) {
+        const auto t = rep::themes::by_name(theme_names.value(idx));
+        preview_lbl->setStyleSheet(QString("background: %1; color: %2; border: 2px solid %3; font-weight: bold;")
+                                       .arg(t.page_bg, t.heading_color, t.accent_color));
+        preview_lbl->setText(tr("%1 — Sample Text").arg(t.name));
+    };
+    connect(combo, &QComboBox::currentIndexChanged, this, update_preview);
+    update_preview(combo->currentIndex());
+    vl->addWidget(preview_lbl);
+
+    auto* bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    vl->addWidget(bb);
+
+    connect(bb, &QDialogButtonBox::accepted, dlg, [combo, theme_names, dlg]() {
+        Service::instance().set_theme(rep::themes::by_name(theme_names.value(combo->currentIndex())));
+        dlg->accept();
+    });
+    connect(bb, &QDialogButtonBox::rejected, dlg, &QDialog::reject);
+
+    dlg->exec();
+    dlg->deleteLater();
+}
+
+void ReportBuilderScreen::show_metadata_dialog() {
+    auto m = Service::instance().metadata();
+
+    auto* dlg = new QDialog(this);
+    dlg->setWindowTitle(tr("Report Metadata"));
+    dlg->setMinimumWidth(420);
+    dlg->setStyleSheet(QString("QDialog { background: %1; color: %2; }"
+                               "QLineEdit { background: %3; color: %2; border: 1px solid %4; padding: 4px; }"
+                               "QLabel { background: transparent; color: %2; }"
+                               "QPushButton { background: %3; color: %2; border: 1px solid %4; padding: 6px 16px; }"
+                               "QPushButton:hover { background: %5; }")
+                           .arg(ui::colors::DARK(), ui::colors::WHITE(), ui::colors::PANEL(), ui::colors::BORDER(),
+                                ui::colors::BG_RAISED()));
+
+    auto* vl = new QVBoxLayout(dlg);
+    auto* form = new QFormLayout;
+    form->setSpacing(8);
+
+    auto* title_edit = new QLineEdit(m.title);
+    auto* author_edit = new QLineEdit(m.author);
+    auto* company_edit = new QLineEdit(m.company);
+    auto* date_edit = new QLineEdit(m.date);
+    date_edit->setPlaceholderText("yyyy-MM-dd");
+
+    auto lbl_style = QString("color: %1;").arg(ui::colors::GRAY());
+    auto add_row = [&](const QString& text, QLineEdit* edit) {
+        auto* lbl = new QLabel(text);
+        lbl->setStyleSheet(lbl_style);
+        form->addRow(lbl, edit);
+    };
+    add_row(tr("Title:"), title_edit);
+    add_row(tr("Author:"), author_edit);
+    add_row(tr("Company:"), company_edit);
+    add_row(tr("Date:"), date_edit);
+    vl->addLayout(form);
+
+    auto* hf_lbl = new QLabel(tr("HEADER / FOOTER"));
+    hf_lbl->setStyleSheet(
+        QString("color: %1; font-size: 11px; font-weight: bold; padding-top: 10px;").arg(ui::colors::MUTED()));
+    vl->addWidget(hf_lbl);
+
+    auto* hf_form = new QFormLayout;
+    hf_form->setSpacing(8);
+
+    auto* hl_edit = new QLineEdit(m.header_left);
+    auto* hc_edit = new QLineEdit(m.header_center);
+    auto* hr_edit = new QLineEdit(m.header_right);
+    auto* fl_edit = new QLineEdit(m.footer_left);
+    auto* fc_edit = new QLineEdit(m.footer_center);
+    auto* fr_edit = new QLineEdit(m.footer_right);
+
+    hl_edit->setPlaceholderText(tr("Left"));
+    hc_edit->setPlaceholderText(tr("Center"));
+    hr_edit->setPlaceholderText(tr("Right"));
+    fl_edit->setPlaceholderText(tr("Left"));
+    fc_edit->setPlaceholderText(tr("Center (use {page})"));
+    fr_edit->setPlaceholderText(tr("Right"));
+
+    auto f_row = [&](const QString& left_text, QLineEdit* l, QLineEdit* c, QLineEdit* r) {
+        auto* row = new QWidget(this);
+        row->setStyleSheet("background: transparent;");
+        auto* rl = new QHBoxLayout(row);
+        rl->setContentsMargins(0, 0, 0, 0);
+        rl->addWidget(l);
+        rl->addWidget(c);
+        rl->addWidget(r);
+        auto* lbl2 = new QLabel(left_text);
+        lbl2->setStyleSheet(lbl_style);
+        hf_form->addRow(lbl2, row);
+    };
+    f_row(tr("Header:"), hl_edit, hc_edit, hr_edit);
+    f_row(tr("Footer:"), fl_edit, fc_edit, fr_edit);
+    vl->addLayout(hf_form);
+
+    auto* bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    vl->addWidget(bb);
+
+    connect(bb, &QDialogButtonBox::accepted, dlg, [=]() {
+        rep::ReportMetadata nm = m;
+        nm.title = title_edit->text();
+        nm.author = author_edit->text();
+        nm.company = company_edit->text();
+        nm.date = date_edit->text();
+        nm.header_left = hl_edit->text();
+        nm.header_center = hc_edit->text();
+        nm.header_right = hr_edit->text();
+        nm.footer_left = fl_edit->text();
+        nm.footer_center = fc_edit->text();
+        nm.footer_right = fr_edit->text();
+        Service::instance().set_metadata(nm);
+        dlg->accept();
+    });
+    connect(bb, &QDialogButtonBox::rejected, dlg, &QDialog::reject);
+
+    dlg->exec();
+    dlg->deleteLater();
+}
+
+// ── File operations ──────────────────────────────────────────────────────────
+
+// Guard every document-replacing action behind one confirmation. The undo
+// stack's clean state is the closest thing the service exposes to a dirty flag:
+// non-clean means there are edits that have not been written to disk.
+bool ReportBuilderScreen::confirm_replace_document(const QString& title) {
+    auto* stack = Service::instance().undo_stack();
+    const bool dirty = stack && !stack->isClean() && stack->count() > 0;
+    if (!dirty && Service::instance().components().isEmpty())
+        return true; // nothing to lose
+    const auto answer =
+        QMessageBox::question(this, title, tr("The current report has unsaved changes.\n\nDiscard them?"),
+                              QMessageBox::Discard | QMessageBox::Cancel, QMessageBox::Cancel);
+    return answer == QMessageBox::Discard;
+}
+
+void ReportBuilderScreen::on_new() {
+    if (!confirm_replace_document(tr("New Report")))
+        return;
+    Service::instance().clear_document();
+    selected_id_ = 0;
+    properties_->show_empty();
+}
+
+void ReportBuilderScreen::on_open() {
+    // on_new() confirmed before wiping the document but Open did not — it
+    // replaced unsaved work with no warning at all.
+    if (!confirm_replace_document(tr("Open Report")))
+        return;
+    QString path =
+        QFileDialog::getOpenFileName(this, tr("Open Report"), "", tr("Fincept Report (*.fincept);;JSON (*.json)"));
+    if (path.isEmpty())
+        return;
+    auto r = Service::instance().load_from(path);
+    if (r.is_err())
+        QMessageBox::warning(this, tr("Open Report"),
+                             tr("Could not open file:\n%1\n\n%2").arg(path, QString::fromStdString(r.error())));
+}
+
+void ReportBuilderScreen::on_save() {
+    auto& svc = Service::instance();
+    QString path = svc.current_file();
+    if (path.isEmpty()) {
+        path = QFileDialog::getSaveFileName(this, tr("Save Report"), svc.metadata().title,
+                                            tr("Fincept Report (*.fincept);;JSON (*.json)"));
+        if (path.isEmpty())
+            return;
+        // QFileDialog does not append the filter suffix on every platform; a
+        // report saved without one won't reopen through the *.fincept filter.
+        if (!path.endsWith(QLatin1String(".fincept"), Qt::CaseInsensitive) &&
+            !path.endsWith(QLatin1String(".json"), Qt::CaseInsensitive))
+            path += QLatin1String(".fincept");
+    }
+    auto r = svc.save_to(path);
+    if (r.is_err()) {
+        QMessageBox::warning(this, tr("Save Report"),
+                             tr("Could not save to:\n%1\n\n%2").arg(path, QString::fromStdString(r.error())));
+        return;
+    }
+    if (auto* stack = svc.undo_stack())
+        stack->setClean(); // saved state == clean state, so Open/New stop nagging
+    services::FileManagerService::instance().import_file(path, "report_builder");
+}
+
+void ReportBuilderScreen::on_export_pdf() {
+    auto m = Service::instance().metadata();
+    QString path = QFileDialog::getSaveFileName(this, tr("Export PDF"), m.title, tr("PDF (*.pdf)"));
+    if (path.isEmpty())
+        return;
+    if (!path.endsWith(QLatin1String(".pdf"), Qt::CaseInsensitive))
+        path += QLatin1String(".pdf");
+    export_pdf_to(path);
+    // export_pdf_to can fail without throwing (painter-begin failure, unwritable
+    // path, disk full) — verify a non-empty PDF actually landed before claiming
+    // success, instead of always reporting success.
+    const QFileInfo out(path);
+    if (out.exists() && out.size() > 0) {
+        QMessageBox::information(this, tr("Export PDF"), tr("Report exported successfully to:\n%1").arg(path));
+    } else {
+        QMessageBox::warning(this, tr("Export PDF"), tr("Failed to export the report to:\n%1").arg(path));
+    }
+}
+
+// Paints every canvas page document onto `printer`. Shared by PDF export and print preview.
+//
+// Why this exists instead of QTextDocument::print():
+//   * The canvas keeps ONE QTextDocument PER PHYSICAL PAGE (a page_break component starts a
+//     new QTextEdit). print() paints only the document it is called on, and the export used
+//     the LAST page's — so any report containing a page break (the shipped "Financial
+//     Statement" template has two) exported only what followed the final break.
+//   * print() cannot draw a running header/footer or page numbers.
+//   * Painting a QTextDocument straight onto a high-resolution printer without telling its
+//     layout about the device lays the text out at screen DPI, so it comes out ~12x too
+//     small. Each clone therefore gets setPaintDevice(printer), exactly as print() does
+//     internally; all geometry below is then in printer device pixels.
+//
+// The page is painted full-bleed (setFullPage) so the theme's paper colour covers the whole
+// sheet — the dark themes use light text that would otherwise print invisibly on white.
+// Returns false if the painter could not be started (unwritable path, no printer).
+static bool rb_paint_report_pages(const QVector<QTextDocument*>& page_docs, QPrinter* printer,
+                                  const rep::ReportMetadata& m, const rep::ReportTheme& theme, QObject* clone_parent) {
+    if (!printer || page_docs.isEmpty())
+        return false;
+
+    printer->setFullPage(true);
+    QPainter painter;
+    if (!painter.begin(printer))
+        return false;
+
+    const double dpi = printer->logicalDpiY();
+    auto mm = [dpi](double v) { return v * dpi / 25.4; };
+
+    const bool has_header = !m.header_left.isEmpty() || !m.header_center.isEmpty() || !m.header_right.isEmpty();
+    const bool has_footer =
+        !m.footer_left.isEmpty() || !m.footer_center.isEmpty() || !m.footer_right.isEmpty() || m.show_page_numbers;
+
+    const double page_w = printer->width();
+    const double page_h = printer->height();
+    const double margin_x = mm(15);
+    const double margin_y = mm(18);
+    const double band_h = mm(8); // header / footer strip, inside the vertical margin's inner edge
+    const double top = margin_y + (has_header ? band_h : 0);
+    const double bottom = margin_y + (has_footer ? band_h : 0);
+    const QSizeF content_size(page_w - 2 * margin_x, page_h - top - bottom);
+
+    QVector<QTextDocument*> docs;
+    docs.reserve(page_docs.size());
+    int total_pages = 0;
+    for (const QTextDocument* src : page_docs) {
+        QTextDocument* d = src->clone(clone_parent);
+        d->documentLayout()->setPaintDevice(printer);
+        d->setPageSize(content_size);
+        total_pages += std::max(1, d->pageCount());
+        docs.append(d);
+    }
+
+    const QColor paper(theme.page_bg);
+    const QColor ink(theme.text_color);
+
+    auto draw_band = [&](int page, bool is_header) {
+        QString left = is_header ? m.header_left : m.footer_left;
+        QString center = is_header ? m.header_center : m.footer_center;
+        QString right = is_header ? m.header_right : m.footer_right;
+        auto tokens = [&](QString s) {
+            s.replace("{page}", QString::number(page));
+            s.replace("{total}", QString::number(total_pages));
+            return s;
+        };
+        left = tokens(left);
+        center = tokens(center);
+        right = tokens(right);
+        // "Show page numbers" only reserved footer space before: unless the user typed
+        // "{page}" into a footer field, ticking the box produced an empty footer band.
+        if (!is_header && m.show_page_numbers && left.isEmpty() && center.isEmpty() && right.isEmpty())
+            center = QStringLiteral("%1 / %2").arg(page).arg(total_pages);
+
+        const double y = is_header ? margin_y - mm(1) : page_h - margin_y - band_h + mm(1);
+        const QRectF r(margin_x, y, page_w - 2 * margin_x, band_h - mm(2));
+        QFont f;
+        f.setPointSizeF(8);
+        painter.setFont(f);
+        const QColor meta = paper.lightness() < 128 ? QColor("#888888") : QColor("#666666");
+        painter.setPen(meta);
+        if (!left.isEmpty())
+            painter.drawText(r, Qt::AlignLeft | Qt::AlignVCenter, left);
+        if (!center.isEmpty())
+            painter.drawText(r, Qt::AlignHCenter | Qt::AlignVCenter, center);
+        if (!right.isEmpty())
+            painter.drawText(r, Qt::AlignRight | Qt::AlignVCenter, right);
+        painter.setPen(QPen(paper.lightness() < 128 ? QColor("#444444") : QColor("#cccccc"), std::max(1.0, mm(0.2))));
+        const double rule_y = is_header ? r.bottom() + mm(1) : r.top() - mm(1);
+        painter.drawLine(QPointF(margin_x, rule_y), QPointF(page_w - margin_x, rule_y));
+    };
+
+    int page_no = 0;
+    for (QTextDocument* d : docs) {
+        const int pages = std::max(1, d->pageCount());
+        for (int p = 0; p < pages; ++p) {
+            if (page_no > 0)
+                printer->newPage();
+            ++page_no;
+
+            painter.fillRect(QRectF(0, 0, page_w, page_h), paper);
+
+            painter.save();
+            painter.translate(margin_x, top - p * content_size.height());
+            QAbstractTextDocumentLayout::PaintContext ctx;
+            ctx.clip = QRectF(0, p * content_size.height(), content_size.width(), content_size.height());
+            painter.setClipRect(ctx.clip);
+            ctx.palette.setColor(QPalette::Text, ink); // for runs with no explicit colour
+            d->documentLayout()->draw(&painter, ctx);
+            painter.restore();
+
+            if (has_header)
+                draw_band(page_no, true);
+            if (has_footer)
+                draw_band(page_no, false);
+        }
+    }
+    painter.end();
+    qDeleteAll(docs);
+    return true;
+}
+
+void ReportBuilderScreen::export_pdf_to(const QString& path) {
+    if (path.isEmpty())
+        return;
+    auto& svc = Service::instance();
+
+    QPrinter printer(QPrinter::HighResolution);
+    printer.setOutputFormat(QPrinter::PdfFormat);
+    printer.setOutputFileName(path);
+    printer.setPageSize(QPageSize(QPageSize::A4));
+
+    // Render once WITHOUT a selected component: the canvas highlights the selection with a
+    // background fill baked into the document, and that highlight used to be printed into
+    // every exported PDF on whichever block happened to be selected.
+    canvas_->render(svc.components(), svc.metadata(), svc.theme(), -1);
+    const bool painted = rb_paint_report_pages(canvas_->page_documents(), &printer, svc.metadata(), svc.theme(), this);
+    refresh_canvas(); // put the on-screen selection highlight back
+
+    // No modal here: this is also the entry point of the MCP report_export_pdf tool, where a
+    // dialog would block the tool call. The interactive caller (on_export_pdf) verifies the
+    // file and reports failure itself.
+    if (!painted) {
+        LOG_ERROR("ReportBuilder", "PDF export failed: could not start painting to the output file");
+        return;
+    }
+
+    services::FileManagerService::instance().import_file(path, "report_builder");
+}
+
+void ReportBuilderScreen::on_preview() {
+    QPrinter printer(QPrinter::HighResolution);
+    printer.setPageSize(QPageSize(QPageSize::A4));
+    QPrintPreviewDialog preview(&printer, this);
+    // Same painter as the PDF export, so the preview shows the page header/footer, the
+    // theme background and EVERY page — it used to print only the last canvas page's
+    // document without header or footer.
+    connect(&preview, &QPrintPreviewDialog::paintRequested, this, [this](QPrinter* p) {
+        auto& svc = Service::instance();
+        canvas_->render(svc.components(), svc.metadata(), svc.theme(), -1); // no selection highlight
+        rb_paint_report_pages(canvas_->page_documents(), p, svc.metadata(), svc.theme(), this);
+        refresh_canvas();
+    });
+    preview.exec();
+}
+
+// ── Show / Hide ──────────────────────────────────────────────────────────────
+
+} // namespace fincept::screens

@@ -1,0 +1,464 @@
+// McpManager.cpp — External MCP server lifecycle management (Qt port)
+
+#include "mcp/McpManager.h"
+
+#include "core/logging/Logger.h"
+#include "storage/repositories/McpServerRepository.h"
+
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QPointer>
+#include <QUuid>
+#include <QtConcurrent/QtConcurrent>
+
+namespace fincept::mcp {
+
+static constexpr const char* TAG = "McpManager";
+
+McpManager::McpManager() {
+    health_timer_ = new QTimer(this);
+    health_timer_->setSingleShot(false);
+    connect(health_timer_, &QTimer::timeout, this, &McpManager::do_health_check);
+}
+
+McpManager& McpManager::instance() {
+    static McpManager s;
+    return s;
+}
+
+// ============================================================================
+// Configuration
+// ============================================================================
+
+void McpManager::initialize() {
+    QMutexLocker lock(&mutex_);
+    configs_.clear();
+
+    auto result = McpServerRepository::instance().list_all();
+    if (result.is_err()) {
+        LOG_WARN(TAG, "Failed to load MCP server configs: " + QString::fromStdString(result.error()));
+        return;
+    }
+
+    for (const auto& srv : result.value()) {
+        McpServerConfig cfg;
+        cfg.id = srv.id;
+        cfg.name = srv.name;
+        cfg.description = srv.description;
+        cfg.command = srv.command;
+        cfg.category = srv.category;
+        cfg.enabled = srv.enabled;
+        cfg.auto_start = srv.auto_start;
+        cfg.status = ServerStatus::Stopped;
+
+        // Parse args: Try JSON array first (supports spaces), fallback to legacy space-split
+        bool args_parsed = false;
+        if (srv.args.trimmed().startsWith('[')) {
+            QJsonDocument doc = QJsonDocument::fromJson(srv.args.toUtf8());
+            if (doc.isArray()) {
+                QJsonArray arr = doc.array();
+                for (const auto& val : arr) {
+                    if (val.isString())
+                        cfg.args.append(val.toString());
+                }
+                args_parsed = true;
+            }
+        }
+
+        if (!args_parsed) {
+            cfg.args = srv.args.split(' ', Qt::SkipEmptyParts);
+        }
+
+        // Parse env: Try JSON object first, fallback to legacy "KEY=VAL KEY2=VAL2" format
+        bool env_parsed = false;
+        if (srv.env.trimmed().startsWith('{')) {
+            QJsonDocument doc = QJsonDocument::fromJson(srv.env.toUtf8());
+            if (doc.isObject()) {
+                QJsonObject obj = doc.object();
+                for (auto it = obj.begin(); it != obj.end(); ++it) {
+                    cfg.env[it.key()] = it.value().toString();
+                }
+                env_parsed = true;
+            }
+        }
+
+        if (!env_parsed && !srv.env.isEmpty()) {
+            for (const auto& pair : srv.env.split(' ', Qt::SkipEmptyParts)) {
+                int eq = pair.indexOf('=');
+                if (eq > 0)
+                    cfg.env[pair.left(eq)] = pair.mid(eq + 1);
+            }
+        }
+
+        configs_.insert(cfg.id, cfg);
+    }
+
+    LOG_INFO(TAG, QString("Loaded %1 MCP server configs").arg(configs_.size()));
+    emit servers_changed();
+}
+
+std::vector<McpServerConfig> McpManager::get_servers() const {
+    QMutexLocker lock(&mutex_);
+    std::vector<McpServerConfig> result;
+    result.reserve(static_cast<std::size_t>(configs_.size()));
+    for (const auto& cfg : configs_)
+        result.push_back(cfg);
+    return result;
+}
+
+Result<void> McpManager::save_server(const McpServerConfig& config) {
+    McpServer srv;
+    srv.id = config.id.isEmpty() ? QUuid::createUuid().toString(QUuid::WithoutBraces) : config.id;
+    srv.name = config.name;
+    srv.description = config.description;
+    srv.command = config.command;
+    srv.category = config.category;
+    srv.enabled = config.enabled;
+    srv.auto_start = config.auto_start;
+    // Status is runtime state owned by start_/stop_server, not something a config edit may
+    // rewrite. This used to write "stopped" unconditionally, so toggling auto-start (or any
+    // other save) on a RUNNING server reset its persisted status — and the config caller's
+    // own `status` field, which is usually just a default, was then stored over the live one.
+    ServerStatus live_status = ServerStatus::Stopped;
+    {
+        QMutexLocker lock(&mutex_);
+        const auto existing = configs_.constFind(srv.id);
+        if (existing != configs_.constEnd())
+            live_status = existing->status;
+    }
+    srv.status = live_status == ServerStatus::Running ? "running" : (live_status == ServerStatus::Error ? "error" : "stopped");
+
+    // Store args and env as JSON strings to correctly handle spaces and special chars
+    QJsonArray args_arr;
+    for (const auto& arg : config.args)
+        args_arr.append(arg);
+    srv.args = QJsonDocument(args_arr).toJson(QJsonDocument::Compact);
+
+    QJsonObject env_obj;
+    for (auto it = config.env.constBegin(); it != config.env.constEnd(); ++it)
+        env_obj[it.key()] = it.value();
+    srv.env = QJsonDocument(env_obj).toJson(QJsonDocument::Compact);
+
+    auto r = McpServerRepository::instance().save(srv);
+    if (r.is_err())
+        return r;
+
+    {
+        QMutexLocker lock(&mutex_);
+        McpServerConfig cfg = config;
+        cfg.id = srv.id;
+        // Keep the live status (see above) rather than whatever the caller's copy carried.
+        const auto existing = configs_.constFind(cfg.id);
+        cfg.status = existing != configs_.constEnd() ? existing->status : ServerStatus::Stopped;
+        configs_.insert(cfg.id, cfg);
+    }
+
+    emit servers_changed();
+    return Result<void>::ok();
+}
+
+Result<void> McpManager::remove_server(const QString& id) {
+    stop_server(id);
+
+    auto r = McpServerRepository::instance().remove(id);
+    if (r.is_err())
+        return r;
+
+    {
+        QMutexLocker lock(&mutex_);
+        configs_.remove(id);
+        tool_cache_.remove(id);
+        last_start_log_.remove(id);
+    }
+
+    emit servers_changed();
+    return Result<void>::ok();
+}
+
+// ============================================================================
+// Server Lifecycle
+// ============================================================================
+
+Result<void> McpManager::start_server(const QString& id) {
+    McpServerConfig cfg;
+    {
+        QMutexLocker lock(&mutex_);
+        if (!configs_.contains(id))
+            return Result<void>::err("Unknown server: " + id.toStdString());
+        // Already running — nothing to do
+        if (clients_.contains(id) && clients_[id]->is_running())
+            return Result<void>::ok();
+        // Guard against concurrent start attempts (auto-start thread + user click).
+        // If status is Starting, another caller is already starting this server.
+        if (configs_[id].status == ServerStatus::Starting)
+            return Result<void>::ok();
+        configs_[id].status = ServerStatus::Starting;
+        cfg = configs_[id];
+    }
+    // mutex released — slow operations below don't block other threads
+
+    auto client = std::make_shared<McpClient>(cfg);
+
+    auto start_result = client->start();
+    if (start_result.is_err()) {
+        const QStringList failed_log = client->get_logs(); // read before the client goes out of scope
+        QMutexLocker lock(&mutex_);
+        last_start_log_.insert(id, failed_log);
+        if (configs_.contains(id))
+            configs_[id].status = ServerStatus::Error;
+        McpServerRepository::instance().set_status(id, "error");
+        emit servers_changed();
+        return start_result;
+    }
+
+    auto init_result = client->initialize();
+    if (init_result.is_err()) {
+        client->stop();
+        const QStringList failed_log = client->get_logs(); // includes whatever the process printed before dying
+        QMutexLocker lock(&mutex_);
+        last_start_log_.insert(id, failed_log);
+        if (configs_.contains(id))
+            configs_[id].status = ServerStatus::Error;
+        McpServerRepository::instance().set_status(id, "error");
+        emit servers_changed();
+        return Result<void>::err("Handshake failed for " + cfg.name.toStdString() + ": " + init_result.error());
+    }
+
+    // Re-acquire mutex only to update state
+    {
+        QMutexLocker lock(&mutex_);
+        McpServerRepository::instance().set_status(id, "running");
+        configs_[id].status = ServerStatus::Running;
+        last_start_log_.remove(id); // the live client's own log supersedes the failed attempt's
+        clients_.insert(id, std::move(client));
+    }
+
+    refresh_tools_for(id);
+
+    emit servers_changed();
+    LOG_INFO(TAG, "MCP server started: " + cfg.name);
+    return Result<void>::ok();
+}
+
+Result<void> McpManager::stop_server(const QString& id) {
+    // Take the shared_ptr under the lock, drop the map entry, then UNLOCK
+    // before stopping. McpClient::stop() blocks for up to ~5 s (terminate →
+    // wait → kill → thread join) and this is called straight from UI click
+    // handlers, so holding mutex_ across it stalled every concurrent
+    // call_external_tool / get_servers / health tick behind a UI button.
+    // The shared_ptr copy keeps the client alive after the map entry is gone.
+    std::shared_ptr<McpClient> client;
+    {
+        QMutexLocker lock(&mutex_);
+        auto it = clients_.find(id);
+        if (it == clients_.end())
+            return Result<void>::ok();
+        client = it.value();
+        clients_.erase(it);
+        tool_cache_.remove(id);
+        if (configs_.contains(id))
+            configs_[id].status = ServerStatus::Stopped;
+    }
+
+    McpServerRepository::instance().set_status(id, "stopped"); // DB I/O — also off the lock
+    if (client)
+        client->stop();
+
+    emit servers_changed();
+    LOG_INFO(TAG, "MCP server stopped: " + id);
+    return Result<void>::ok();
+}
+
+Result<void> McpManager::restart_server(const QString& id) {
+    stop_server(id);
+    return start_server(id);
+}
+
+void McpManager::start_auto_servers() {
+    QMutexLocker lock(&mutex_);
+    QStringList to_start;
+    for (const auto& cfg : configs_) {
+        if (cfg.auto_start && cfg.enabled)
+            to_start.append(cfg.id);
+    }
+    lock.unlock();
+
+    for (const auto& id : to_start) {
+        auto r = start_server(id);
+        if (r.is_err())
+            LOG_WARN(TAG, "Auto-start failed for " + id + ": " + QString::fromStdString(r.error()));
+    }
+}
+
+void McpManager::stop_all() {
+    QMutexLocker lock(&mutex_);
+    QStringList ids = clients_.keys();
+    lock.unlock();
+
+    for (const auto& id : ids)
+        stop_server(id);
+}
+
+void McpManager::shutdown() {
+    stop_health_check();
+    stop_all();
+}
+
+// ============================================================================
+// Health Check
+// ============================================================================
+
+void McpManager::start_health_check(int interval_seconds) {
+    health_timer_->setInterval(interval_seconds * 1000);
+    health_timer_->start();
+}
+
+void McpManager::stop_health_check() {
+    if (health_timer_->isActive())
+        health_timer_->stop();
+}
+
+void McpManager::do_health_check() {
+    // Don't overlap passes: a slow ping could still be running when the timer
+    // fires again.
+    bool expected = false;
+    if (!health_check_running_.compare_exchange_strong(expected, true))
+        return;
+
+    // Snapshot the clients under the lock — shared_ptr copies keep each alive
+    // across its ping() even if stop_server() removes the map entry meanwhile.
+    QVector<QPair<QString, std::shared_ptr<McpClient>>> targets;
+    {
+        QMutexLocker lock(&mutex_);
+        targets.reserve(clients_.size());
+        for (auto it = clients_.constBegin(); it != clients_.constEnd(); ++it)
+            if (it.value())
+                targets.append({it.key(), it.value()});
+    }
+    if (targets.isEmpty()) {
+        health_check_running_ = false;
+        return;
+    }
+
+    // Ping OFF the UI thread. ping() blocks up to ~5s per server, so looping on
+    // the UI thread froze the whole terminal every health tick (P1). The
+    // follow-up (restart) is marshalled back to the main thread in
+    // on_health_result() because it manages a thread-affine QProcess.
+    QPointer<McpManager> self = this;
+    (void)QtConcurrent::run([self, targets]() {
+        for (const auto& t : targets) {
+            const bool ok = !t.second->ping().is_err();
+            if (!self)
+                return;
+            const QString id = t.first;
+            QMetaObject::invokeMethod(
+                self, [self, id, ok]() { if (self) self->on_health_result(id, ok); }, Qt::QueuedConnection);
+        }
+        if (self)
+            QMetaObject::invokeMethod(
+                self, [self]() { if (self) self->health_check_running_ = false; }, Qt::QueuedConnection);
+    });
+}
+
+void McpManager::on_health_result(const QString& id, bool ok) {
+    // Runs on the main thread so restart_attempts_ (only mutated here) needs no
+    // lock. The RESTART itself must not: restart_server → start_server →
+    // McpClient::start() → waitForStarted(60000) behind a
+    // Qt::BlockingQueuedConnection, then initialize() → send_request(…, 120000)
+    // blocking on rpc_cond_. A dead server therefore froze the whole UI for up
+    // to 180 s, three times over (MAX_RESTART_ATTEMPTS) — the ping was already
+    // offloaded for exactly this reason, and marshalling the follow-up back
+    // here undid it.
+    if (ok) {
+        restart_attempts_.remove(id); // reset on success
+        return;
+    }
+    LOG_WARN(TAG, "Health check failed for " + id);
+    const int attempts = restart_attempts_.value(id, 0);
+    if (attempts < MAX_RESTART_ATTEMPTS) {
+        restart_attempts_[id] = attempts + 1;
+        LOG_INFO(TAG,
+                 QString("Restarting server %1 (attempt %2/%3)").arg(id).arg(attempts + 1).arg(MAX_RESTART_ATTEMPTS));
+        QPointer<McpManager> self = this;
+        const QString sid = id;
+        (void)QtConcurrent::run([self, sid]() {
+            if (self)
+                self->restart_server(sid);
+        });
+    } else {
+        LOG_ERROR(TAG, "Server " + id + " exceeded max restart attempts — giving up");
+        McpServerRepository::instance().set_status(id, "error");
+    }
+}
+
+// ============================================================================
+// Tool Aggregation
+// ============================================================================
+
+std::vector<ExternalTool> McpManager::get_all_external_tools() {
+    QMutexLocker lock(&mutex_);
+    std::vector<ExternalTool> all;
+    for (const auto& tools : tool_cache_)
+        all.insert(all.end(), tools.begin(), tools.end());
+    return all;
+}
+
+Result<QJsonObject> McpManager::call_external_tool(const QString& server_id, const QString& tool_name,
+                                                   const QJsonObject& args) {
+    // Hold a shared_ptr COPY across the (blocking, up to ~120s) call. This runs
+    // on a QtConcurrent pool thread while stop_server()/restart_server() can run
+    // on the main thread and erase the map entry; the previous raw pointer then
+    // outlived the McpClient it pointed at → use-after-free. The copy keeps the
+    // object alive until the call returns.
+    std::shared_ptr<McpClient> client;
+    {
+        QMutexLocker lock(&mutex_);
+        auto it = clients_.find(server_id);
+        if (it == clients_.end() || !it.value())
+            return Result<QJsonObject>::err("Server not running: " + server_id.toStdString());
+        client = it.value();
+    }
+    return client->call_tool(tool_name, args);
+}
+
+McpClient* McpManager::get_client(const QString& id) const {
+    auto it = clients_.find(id);
+    if (it == clients_.end())
+        return nullptr;
+    return it->get();
+}
+
+QStringList McpManager::get_logs(const QString& id) const {
+    QMutexLocker lock(&mutex_);
+    auto it = clients_.find(id);
+    if (it == clients_.end() || !it.value())
+        return last_start_log_.value(id); // no live client: the failed start's output, if any
+    return it->get()->get_logs();
+}
+
+void McpManager::refresh_tools_for(const QString& id) {
+    // shared_ptr copy, same reasoning as call_external_tool: list_tools()
+    // blocks on JSON-RPC with the lock released, and stop_server() can erase
+    // the map entry meanwhile — a raw pointer would outlive its McpClient.
+    std::shared_ptr<McpClient> client;
+    {
+        QMutexLocker lock(&mutex_);
+        auto it = clients_.find(id);
+        if (it == clients_.end() || !it.value())
+            return;
+        client = it.value();
+    }
+
+    auto result = client->list_tools();
+    if (result.is_err()) {
+        LOG_WARN(TAG, "Failed to list tools for " + id + ": " + QString::fromStdString(result.error()));
+        return;
+    }
+
+    QMutexLocker l2(&mutex_);
+    tool_cache_[id] = result.value();
+    LOG_INFO(TAG, QString("Cached %1 tools from server %2").arg(result.value().size()).arg(id));
+}
+
+} // namespace fincept::mcp

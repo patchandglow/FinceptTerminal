@@ -1,0 +1,737 @@
+// src/screens/economics/panels/EconPanelBase.cpp
+#include "screens/economics/panels/EconPanelBase.h"
+
+#include "core/logging/Logger.h"
+#include "ui/theme/Theme.h"
+#include "ui/theme/ThemeManager.h"
+
+#include <QColor>
+#include <QDateTime>
+#include <QFile>
+#include <QFileDialog>
+#include <QHBoxLayout>
+#include <QHeaderView>
+#include <QJsonObject>
+#include <QLineEdit>
+#include <QListWidget>
+#include <QMessageBox>
+#include <QScrollBar>
+#include <QTextStream>
+#include <QVBoxLayout>
+
+#include <algorithm>
+#include <cmath>
+#include <utility>
+
+namespace fincept::screens {
+
+// ── Stylesheet (token-based) ──────────────────────────────────────────────────
+
+QString EconPanelBase::panel_style() const {
+    using namespace ui::colors;
+    int r = QColor(color_).red();
+    int g = QColor(color_).green();
+    int b = QColor(color_).blue();
+    return QString(
+                   // Toolbar control labels ("DATASET", "COUNTRY", …). Every one
+                   // of the 31 panels currently does
+                   //     lbl->setStyleSheet(ctrl_label_style());
+                   // which is a full CSS parse per label per panel. This rule
+                   // lets a panel just do setObjectName("econCtrlLabel") and
+                   // inherit the same look for free — the container stylesheet
+                   // is parsed once either way. Migrate panels to it as they are
+                   // touched; ctrl_label_style() stays for the ones not yet moved.
+                   // %9 is TEXT_TERTIARY (same token ctrl_label_style() uses and
+                   // the same one #econStatLabel uses). NOT %12 — that is a
+                   // BACKGROUND colour here (alternate-background-color /
+                   // #econTitleBar), so using it would render the label
+                   // invisible against its own panel.
+                   "QLabel#econCtrlLabel { color:%9; font-size:9px; font-weight:700;"
+                   "  background:transparent; }"
+                   "#econToolbar { background:%5; border-bottom:1px solid %6; }"
+                   "#econFetchBtn { background:%1; color:%7; border:none;"
+                   "  font-size:10px; font-weight:700; padding:4px 14px; }"
+                   "#econFetchBtn:hover { background:rgba(%2,%3,%4,0.75); }"
+                   "#econFetchBtn:disabled { background:%6; color:%8; }"
+                   "#econCsvBtn { background:transparent; color:%9; border:1px solid %6;"
+                   "  font-size:10px; font-weight:700; padding:4px 10px; }"
+                   "#econCsvBtn:hover { color:%10; background:%11; }"
+                   "QComboBox, QSpinBox, QDateEdit, QLineEdit {"
+                   "  background:%7; color:%10; border:1px solid %6;"
+                   "  font-size:11px; padding:2px 6px; }"
+                   "QComboBox::drop-down, QDateEdit::drop-down { border:none; }"
+                   "QComboBox QAbstractItemView { background:%5; color:%10;"
+                   "  border:1px solid %6; }"
+                   "QTableWidget { background:%7; color:%10; border:none;"
+                   "  gridline-color:%6; font-size:11px; alternate-background-color:%12; }"
+                   "QTableWidget::item { padding:5px 8px; border-bottom:1px solid %6; }"
+                   "QTableWidget::item:selected { background:rgba(%2,%3,%4,0.1); color:%1; }"
+                   "QHeaderView::section { background:%5; color:%9; border:none;"
+                   "  border-bottom:2px solid %6; border-right:1px solid %6;"
+                   "  padding:5px 8px; font-size:10px; font-weight:700; letter-spacing:0.5px; }"
+                   "#econCardsRow  { background:%7; border-bottom:1px solid %6; }"
+                   "#econTitleBar  { background:%12; border-bottom:1px solid %6; }"
+                   "#econStatCard { background:%12; border:1px solid %6; }"
+                   "#econStatCard:hover { border-color:%13; }"
+                   "#econStatLabel { color:%9; font-size:8px; font-weight:700;"
+                   "  letter-spacing:1px; background:transparent; }"
+                   "#econStatVal  { color:%1;  font-size:15px; font-weight:700; background:transparent; }"
+                   "#econStatPos  { color:%16; font-size:15px; font-weight:700; background:transparent; }"
+                   "#econStatNeg  { color:%15; font-size:15px; font-weight:700; background:transparent; }"
+                   "#econStatSub  { color:%14; font-size:9px;  background:transparent; }"
+                   "#econEmptyPage { background:%7; }"
+                   "#econEmptyMsg   { color:%9;  font-size:13px; background:transparent; }"
+                   "#econLoadingMsg { color:%1;  font-size:13px; background:transparent; }"
+                   "#econErrMsg     { color:%15; font-size:12px; background:transparent; }"
+                   "#econTitleLbl { color:%10; font-size:11px; font-weight:700;"
+                   "  background:transparent; }"
+                   "#econRowCount { color:%14; font-size:9px; background:transparent; }"
+                   "QScrollBar:vertical { background:%7; width:5px; }"
+                   "QScrollBar::handle:vertical { background:%6; min-height:20px; }"
+                   "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0; }"
+                   "QScrollBar:horizontal { background:%7; height:5px; }"
+                   "QScrollBar::handle:horizontal { background:%6; min-width:20px; }"
+                   "QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width:0; }")
+        .arg(color_) // %1: source accent
+        .arg(r)
+        .arg(g)
+        .arg(b)                // %2,%3,%4: accent RGB
+        .arg(BG_RAISED())      // %5
+        .arg(BORDER_DIM())     // %6
+        .arg(BG_BASE())        // %7
+        .arg(TEXT_DIM())       // %8
+        .arg(TEXT_SECONDARY()) // %9
+        .arg(TEXT_PRIMARY())   // %10
+        .arg(BG_HOVER())       // %11
+        .arg(BG_SURFACE())     // %12
+        .arg(BORDER_BRIGHT())  // %13
+        .arg(TEXT_TERTIARY())  // %14
+        .arg(NEGATIVE())       // %15
+        .arg(POSITIVE());      // %16
+}
+
+// ── Reusable token-based style helpers ────────────────────────────────────────
+
+QString EconPanelBase::sidebar_style() {
+    using namespace ui::colors;
+    return QString("background:%1; border-right:1px solid %2;").arg(BG_SURFACE(), BORDER_DIM());
+}
+
+QString EconPanelBase::section_hdr_style() {
+    using namespace ui::colors;
+    return QString("background:%1; border-bottom:1px solid %2;").arg(BG_RAISED(), BORDER_DIM());
+}
+
+QString EconPanelBase::section_lbl_style() {
+    using namespace ui::colors;
+    return QString("color:%1; font-size:8px; font-weight:700;"
+                   " letter-spacing:1px; background:transparent; padding:4px 10px;")
+        .arg(TEXT_TERTIARY());
+}
+
+QString EconPanelBase::search_input_style() {
+    using namespace ui::colors;
+    return QString("background:%1; color:%2; border:none;"
+                   " border-bottom:1px solid %3; padding:4px 10px; font-size:11px;")
+        .arg(BG_BASE(), TEXT_PRIMARY(), BORDER_DIM());
+}
+
+QString EconPanelBase::ctrl_label_style() {
+    using namespace ui::colors;
+    return QString("color:%1; font-size:9px; font-weight:700; background:transparent;").arg(TEXT_TERTIARY());
+}
+
+QString EconPanelBase::list_style() const {
+    using namespace ui::colors;
+    QColor c(color_);
+    QString rgba = QString("%1,%2,%3").arg(c.red()).arg(c.green()).arg(c.blue());
+    return QString("QListWidget { background:transparent; border:none; outline:none; }"
+                   "QListWidget::item { color:%1; padding:5px 10px;"
+                   "  border-bottom:1px solid %2; font-size:11px; }"
+                   "QListWidget::item:hover { color:%3; background:%4; }"
+                   "QListWidget::item:selected { color:%5; background:rgba(%6,0.1);"
+                   "  border-left:2px solid %5; font-weight:700; }")
+        .arg(TEXT_SECONDARY(), BG_RAISED(), TEXT_PRIMARY(), BG_HOVER())
+        .arg(color_, rgba);
+}
+
+QString EconPanelBase::notice_style() {
+    using namespace ui::colors;
+    return QString("color:%1; font-size:9px; background:transparent;").arg(WARNING());
+}
+
+// ── Constructor ───────────────────────────────────────────────────────────────
+
+EconPanelBase::EconPanelBase(const QString& source_id, const QString& color, QWidget* parent)
+    : QWidget(parent), source_id_(source_id), color_(color) {
+    connect(&ui::ThemeManager::instance(), &ui::ThemeManager::theme_changed, this, &EconPanelBase::refresh_panel_theme);
+}
+
+// ── Build ─────────────────────────────────────────────────────────────────────
+
+void EconPanelBase::build_base_ui(QWidget* container) {
+    container_ = container;
+    container->setStyleSheet(panel_style());
+
+    auto* root = new QVBoxLayout(container);
+    root->setContentsMargins(0, 0, 0, 0);
+    root->setSpacing(0);
+
+    // Toolbar
+    auto* toolbar = new QWidget(this);
+    toolbar->setObjectName("econToolbar");
+    toolbar->setFixedHeight(40);
+    auto* thl = new QHBoxLayout(toolbar);
+    thl->setContentsMargins(10, 0, 10, 0);
+    thl->setSpacing(6);
+    build_controls(thl);
+    thl->addStretch(1);
+
+    fetch_btn_ = new QPushButton(tr("FETCH"));
+    fetch_btn_->setObjectName("econFetchBtn");
+    fetch_btn_->setCursor(Qt::PointingHandCursor);
+    fetch_btn_->setAccessibleName(tr("Fetch data"));
+    fetch_btn_->setAccessibleDescription(tr("Run the query against the %1 data source").arg(source_id_));
+    fetch_btn_->setToolTip(tr("Run the query (Enter)"));
+    connect(fetch_btn_, &QPushButton::clicked, this, &EconPanelBase::on_fetch);
+
+    export_btn_ = new QPushButton(tr("CSV"));
+    export_btn_->setObjectName("econCsvBtn");
+    export_btn_->setCursor(Qt::PointingHandCursor);
+    export_btn_->setAccessibleName(tr("Export results as CSV"));
+    export_btn_->setToolTip(tr("Export the full result set (all pages) as CSV"));
+    connect(export_btn_, &QPushButton::clicked, this, &EconPanelBase::export_csv);
+
+    thl->addWidget(fetch_btn_);
+    thl->addWidget(export_btn_);
+    root->addWidget(toolbar);
+
+    // Explicit keyboard tab order across the query form, in visual order,
+    // ending on FETCH → CSV. Without this Qt falls back to construction order,
+    // which for the sidebar panels starts focus in the results table.
+    // Also make Enter in any toolbar text field run the query.
+    {
+        QWidget* prev = nullptr;
+        for (int i = 0; i < thl->count(); ++i) {
+            QWidget* w = thl->itemAt(i)->widget();
+            if (!w || !(w->focusPolicy() & Qt::TabFocus))
+                continue;
+            if (prev)
+                QWidget::setTabOrder(prev, w);
+            prev = w;
+            // Enter must not bypass the disabled FETCH button: a second query started while one is in
+            // flight lets a slow earlier response overwrite the newer selection.
+            if (auto* le = qobject_cast<QLineEdit*>(w))
+                connect(le, &QLineEdit::returnPressed, this, [this]() {
+                    if (fetch_btn_ && fetch_btn_->isEnabled())
+                        on_fetch();
+                });
+        }
+    }
+
+    // Stat cards row
+    cards_row_ = new QWidget(this);
+    cards_row_->setObjectName("econCardsRow");
+    auto* crhl = new QHBoxLayout(cards_row_);
+    crhl->setContentsMargins(10, 6, 10, 6);
+    crhl->setSpacing(6);
+
+    auto make_card = [&](const QString& label, QLabel*& out, QLabel*& title_out) {
+        auto* card = new QWidget(this);
+        card->setObjectName("econStatCard");
+        card->setMinimumWidth(90);
+        auto* vl = new QVBoxLayout(card);
+        vl->setContentsMargins(10, 6, 10, 6);
+        vl->setSpacing(1);
+        auto* lbl = new QLabel(label);
+        lbl->setObjectName("econStatLabel");
+        title_out = lbl;
+        out = new QLabel("—");
+        out->setObjectName("econStatVal");
+        vl->addWidget(lbl);
+        vl->addWidget(out);
+        crhl->addWidget(card);
+    };
+    make_card(tr("LATEST"), stat_latest_, stat_latest_lbl_);
+    make_card(tr("CHANGE"), stat_change_, stat_change_lbl_);
+    make_card(tr("MIN"), stat_min_, stat_min_lbl_);
+    make_card(tr("MAX"), stat_max_, stat_max_lbl_);
+    make_card(tr("AVG"), stat_avg_, stat_avg_lbl_);
+    make_card(tr("POINTS"), stat_count_, stat_count_lbl_);
+    crhl->addStretch(1);
+    root->addWidget(cards_row_);
+
+    // Title bar
+    title_bar_ = new QWidget(this);
+    title_bar_->setObjectName("econTitleBar");
+    auto* tbhl = new QHBoxLayout(title_bar_);
+    tbhl->setContentsMargins(12, 4, 12, 4);
+    title_lbl_ = new QLabel;
+    title_lbl_->setObjectName("econTitleLbl");
+    row_count_ = new QLabel;
+    row_count_->setObjectName("econRowCount");
+    tbhl->addWidget(title_lbl_);
+    tbhl->addStretch(1);
+    tbhl->addWidget(row_count_);
+    root->addWidget(title_bar_);
+
+    // Content stack
+    stack_ = new QStackedWidget;
+
+    auto* empty_pg = new QWidget(this);
+    empty_pg->setObjectName("econEmptyPage");
+    auto* evl = new QVBoxLayout(empty_pg);
+    evl->setAlignment(Qt::AlignCenter);
+    empty_lbl_ = new QLabel(tr("Select parameters and click FETCH"));
+    empty_lbl_->setObjectName("econEmptyMsg");
+    empty_lbl_->setAlignment(Qt::AlignCenter);
+    empty_lbl_->setWordWrap(true);
+    status_kind_ = StatusKind::Empty;
+    status_msg_ = tr("Select parameters and click FETCH");
+    evl->addWidget(empty_lbl_);
+    stack_->addWidget(empty_pg); // index 0
+
+    auto* table_page = new QWidget(this);
+    auto* tpl = new QVBoxLayout(table_page);
+    tpl->setContentsMargins(0, 0, 0, 0);
+    tpl->setSpacing(0);
+
+    table_ = new QTableWidget;
+    table_->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    table_->setSelectionBehavior(QAbstractItemView::SelectRows);
+    table_->verticalHeader()->setVisible(false);
+    table_->setAlternatingRowColors(true);
+    table_->setShowGrid(true);
+    table_->setAccessibleName(tr("Results table"));
+    tpl->addWidget(table_, 1);
+
+    pager_ = new ui::PaginationBar(this);
+    connect(pager_, &ui::PaginationBar::page_changed, this, [this]() { render_page(); });
+    tpl->addWidget(pager_);
+
+    stack_->addWidget(table_page); // index 1
+
+    root->addWidget(stack_, 1);
+
+    // Apply token-based inline styles for non-QSS-covered widgets
+    refresh_panel_theme();
+}
+
+// ── Theme refresh ─────────────────────────────────────────────────────────────
+
+void EconPanelBase::refresh_panel_theme() {
+    if (container_)
+        container_->setStyleSheet(panel_style());
+}
+
+// ── State ─────────────────────────────────────────────────────────────────────
+
+bool EconPanelBase::keeps_state_on_activate() const {
+    return (stack_ && stack_->currentIndex() != 0) || status_kind_ == StatusKind::Loading;
+}
+
+void EconPanelBase::show_loading(const QString& msg) {
+    if (!empty_lbl_)
+        return;
+    status_kind_ = StatusKind::Loading;
+    status_msg_ = msg.isEmpty() ? tr("Fetching data…") : msg;
+    empty_lbl_->setObjectName("econLoadingMsg");
+    empty_lbl_->style()->unpolish(empty_lbl_);
+    empty_lbl_->style()->polish(empty_lbl_);
+    empty_lbl_->setText(status_msg_);
+    stack_->setCurrentIndex(0);
+    if (fetch_btn_)
+        fetch_btn_->setEnabled(false);
+}
+
+void EconPanelBase::show_error(const QString& msg) {
+    if (!empty_lbl_)
+        return;
+    status_kind_ = StatusKind::Error;
+    status_msg_ = msg;
+    empty_lbl_->setObjectName("econErrMsg");
+    empty_lbl_->style()->unpolish(empty_lbl_);
+    empty_lbl_->style()->polish(empty_lbl_);
+    empty_lbl_->setText(tr("Error: %1").arg(msg));
+    stack_->setCurrentIndex(0);
+    if (fetch_btn_)
+        fetch_btn_->setEnabled(true);
+}
+
+void EconPanelBase::show_empty(const QString& msg) {
+    if (!empty_lbl_)
+        return;
+    status_kind_ = StatusKind::Empty;
+    status_msg_ = msg.isEmpty() ? tr("Select parameters and click FETCH") : msg;
+    empty_lbl_->setObjectName("econEmptyMsg");
+    empty_lbl_->style()->unpolish(empty_lbl_);
+    empty_lbl_->style()->polish(empty_lbl_);
+    empty_lbl_->setText(status_msg_);
+    stack_->setCurrentIndex(0);
+    if (fetch_btn_)
+        fetch_btn_->setEnabled(true);
+}
+
+void EconPanelBase::show_table() {
+    stack_->setCurrentIndex(1);
+    if (fetch_btn_)
+        fetch_btn_->setEnabled(true);
+}
+
+int EconPanelBase::add_content_page(QWidget* page) {
+    if (!stack_ || !page)
+        return -1;
+    return stack_->addWidget(page);
+}
+
+void EconPanelBase::show_content_page(int index) {
+    if (!stack_ || index < 0 || index >= stack_->count())
+        return;
+    stack_->setCurrentIndex(index);
+    if (fetch_btn_)
+        fetch_btn_->setEnabled(true);
+}
+
+void EconPanelBase::set_stats_visible(bool visible) {
+    if (cards_row_)
+        cards_row_->setVisible(visible);
+}
+
+// ── Display ───────────────────────────────────────────────────────────────────
+
+void EconPanelBase::display(const QJsonArray& rows, const QString& title) {
+    if (rows.isEmpty()) {
+        show_empty(tr("No data returned for this selection"));
+        return;
+    }
+
+    all_rows_ = rows;
+
+    columns_.clear();
+    for (const auto& v : rows) {
+        for (const auto& k : v.toObject().keys())
+            if (!columns_.contains(k))
+                columns_ << k;
+    }
+    static const QStringList kDateKeys = {"date",   "period",      "year",        "time",    "Date",
+                                          "Period", "TIME_PERIOD", "record_date", "ref_date"};
+    for (const auto& dk : kDateKeys) {
+        int idx = columns_.indexOf(dk);
+        if (idx > 0) {
+            columns_.move(idx, 0);
+            break;
+        }
+    }
+    static const QStringList kValKeys = {"value", "Value", "val", "OBS_VALUE", "obs_value", "amount", "rate"};
+    for (const auto& vk : kValKeys) {
+        int idx = columns_.indexOf(vk);
+        if (idx > 1) {
+            columns_.move(idx, 1);
+            break;
+        }
+    }
+
+    pager_->set_total(rows.size());
+    render_page();
+
+    if (title_lbl_)
+        title_lbl_->setText(title);
+
+    // update_stats() derives latest_date_, so it must run before the row count
+    // line that reports the vintage.
+    update_stats(rows);
+
+    if (row_count_)
+        row_count_->setText(latest_date_.isEmpty()
+                                ? tr("%1 records").arg(rows.size())
+                                : tr("%1 records · as of %2").arg(rows.size()).arg(latest_date_));
+
+    show_table();
+}
+
+void EconPanelBase::render_page() {
+    const int start = pager_->offset();
+    const int count = std::min<int>(pager_->page_size(), all_rows_.size() - start);
+
+    // Preserve the user's vertical scroll offset across a re-render (page-size
+    // change, language switch) so the row they were reading doesn't jump.
+    const int scroll_pos = table_->verticalScrollBar() ? table_->verticalScrollBar()->value() : 0;
+    const int sel_row = table_->currentRow();
+
+    table_->setUpdatesEnabled(false);
+    table_->setColumnCount(columns_.size());
+    table_->setHorizontalHeaderLabels(columns_);
+    table_->setRowCount(count);
+
+    const QColor accent(color_);
+    for (int r = 0; r < count; ++r) {
+        const auto obj = all_rows_[start + r].toObject();
+        for (int c = 0; c < columns_.size(); ++c) {
+            const auto jv = obj[columns_[c]];
+            QString text;
+            bool numeric = false;
+            if (jv.isDouble()) {
+                numeric = true;
+                const double v = jv.toDouble();
+                // Render exact integers in full — 'g' turned large national
+                // accounts figures (e.g. 21433226000000) into "2.1433226e+13".
+                if (v == std::floor(v) && std::abs(v) < 1e15)
+                    text = QString::number(static_cast<qint64>(v));
+                else
+                    text = QString::number(v, 'g', 10);
+            } else if (jv.isNull() || jv.isUndefined()) {
+                text = QStringLiteral("—"); // explicit gap, never a silent 0
+            } else if (jv.isBool()) {
+                text = jv.toBool() ? QStringLiteral("true") : QStringLiteral("false");
+            } else {
+                text = jv.toString();
+                // Strings that are purely numeric (FRED/BLS return values as
+                // strings) still belong in a right-aligned column.
+                bool ok = false;
+                text.toDouble(&ok);
+                numeric = ok && !text.isEmpty();
+            }
+            auto* item = new QTableWidgetItem(text);
+            if (c == 0)
+                item->setForeground(accent);
+            // DESIGN_SYSTEM §5.4 — numeric columns are right-aligned.
+            item->setTextAlignment(numeric ? (Qt::AlignRight | Qt::AlignVCenter) : (Qt::AlignLeft | Qt::AlignVCenter));
+            table_->setItem(r, c, item);
+        }
+    }
+
+    table_->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
+    if (columns_.size() > 1)
+        table_->horizontalHeader()->setSectionResizeMode(columns_.size() - 1, QHeaderView::Stretch);
+    table_->setUpdatesEnabled(true);
+
+    if (sel_row >= 0 && sel_row < count)
+        table_->setCurrentCell(sel_row, 0);
+    if (table_->verticalScrollBar())
+        table_->verticalScrollBar()->setValue(scroll_pos);
+}
+
+void EconPanelBase::update_stats(const QJsonArray& rows) {
+    // Collect (date, value) pairs and sort chronologically so LATEST/CHANGE are
+    // correct whether the provider returns oldest- or newest-first (min/max/avg
+    // are order-independent). ISO-style dates sort correctly lexically; rows
+    // without a recognisable date keep their original order (stable sort).
+    struct DatedVal {
+        QString date;
+        double value;
+    };
+    QVector<DatedVal> pts;
+    for (const auto& v : rows) {
+        const auto obj = v.toObject();
+        QJsonValue jv = obj["value"];
+        if (jv.isUndefined())
+            jv = obj["Value"];
+        if (jv.isUndefined())
+            jv = obj["OBS_VALUE"];
+        if (jv.isUndefined())
+            jv = obj["obs_value"];
+        if (jv.isUndefined())
+            jv = obj["amount"];
+        if (jv.isUndefined())
+            jv = obj["rate"];
+        if (jv.isUndefined()) {
+            auto keys = obj.keys();
+            if (keys.size() > 1)
+                jv = obj[keys[1]];
+        }
+        bool ok = false;
+        double d = jv.toString().toDouble(&ok);
+        if (!ok && jv.isDouble()) {
+            d = jv.toDouble();
+            ok = true;
+        }
+        if (!ok)
+            continue;
+        // Date key: providers use very different spellings, and several return
+        // the period as a JSON *number* (WTO "Year", IMF "year"), where
+        // QJsonValue::toString() yields an empty string. Normalise both cases,
+        // and zero-pad bare years so "999" can't sort after "1999".
+        QString date;
+        for (const char* k : {"date", "Date", "TIME_PERIOD", "time_period", "period", "Period", "time", "obs_date",
+                              "year", "Year", "YEAR", "record_date", "ref_date"}) {
+            if (!obj.contains(QLatin1String(k)))
+                continue;
+            const QJsonValue dv = obj[QLatin1String(k)];
+            if (dv.isDouble())
+                date = QString::number(static_cast<qint64>(dv.toDouble()));
+            else
+                date = dv.toString();
+            if (!date.isEmpty())
+                break;
+        }
+        bool year_only = false;
+        const int year_val = date.toInt(&year_only);
+        if (year_only && date.size() < 4 && year_val >= 0)
+            date = date.rightJustified(4, '0');
+        pts.append({date, d});
+    }
+    std::stable_sort(pts.begin(), pts.end(), [](const DatedVal& a, const DatedVal& b) { return a.date < b.date; });
+    // Most recent period actually present in the payload — surfaced next to the
+    // record count so the user can see the data's vintage, not just its size.
+    latest_date_ = pts.isEmpty() ? QString() : pts.last().date;
+    QVector<double> vals;
+    vals.reserve(pts.size());
+    for (const auto& p : pts)
+        vals << p.value;
+
+    if (vals.isEmpty()) {
+        for (auto* l : {stat_latest_, stat_change_, stat_min_, stat_max_, stat_avg_, stat_count_})
+            if (l)
+                l->setText("—");
+        if (stat_count_)
+            stat_count_->setText(QString::number(rows.size()));
+        return;
+    }
+
+    double latest = vals.last();
+    double prev = vals.size() > 1 ? vals[vals.size() - 2] : latest;
+    double change = (prev != 0.0) ? ((latest - prev) / qAbs(prev)) * 100.0 : 0.0;
+    double mn = *std::min_element(vals.begin(), vals.end());
+    double mx = *std::max_element(vals.begin(), vals.end());
+    double sum = 0.0;
+    for (double x : vals)
+        sum += x;
+    double avg = sum / vals.size();
+
+    auto fmt = [](double v) { return QString::number(v, 'g', 6); };
+
+    if (stat_latest_)
+        stat_latest_->setText(fmt(latest));
+    if (stat_change_) {
+        stat_change_->setText((change >= 0 ? "+" : "") + QString::number(change, 'f', 2) + "%");
+        stat_change_->setObjectName(change >= 0 ? "econStatPos" : "econStatNeg");
+        stat_change_->style()->unpolish(stat_change_);
+        stat_change_->style()->polish(stat_change_);
+    }
+    if (stat_min_)
+        stat_min_->setText(fmt(mn));
+    if (stat_max_)
+        stat_max_->setText(fmt(mx));
+    if (stat_avg_)
+        stat_avg_->setText(fmt(avg));
+    if (stat_count_)
+        stat_count_->setText(QString::number(rows.size()));
+}
+
+// ── CSV ───────────────────────────────────────────────────────────────────────
+
+void EconPanelBase::export_csv() {
+    // Export the FULL result set (all_rows_), not just the page currently
+    // rendered in table_. The table only ever holds one page, so the previous
+    // table-driven export silently truncated every multi-page series.
+    if (all_rows_.isEmpty() || columns_.isEmpty())
+        return;
+
+    QString path =
+        QFileDialog::getSaveFileName(this, tr("Export CSV"), source_id_ + "_data.csv", tr("CSV Files (*.csv)"));
+    if (path.isEmpty())
+        return;
+
+    QFile file(path);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        // Say so — silently returning looked like a successful export.
+        LOG_WARN("EconPanel", QString("CSV export failed to open %1: %2").arg(path, file.errorString()));
+        QMessageBox::warning(this, tr("Export CSV"), tr("Could not write %1:\n%2").arg(path, file.errorString()));
+        return;
+    }
+    QTextStream out(&file);
+    out.setEncoding(QStringConverter::Utf8);
+
+    auto quote = [](QString v) {
+        if (v.contains(',') || v.contains('"') || v.contains('\n'))
+            v = "\"" + v.replace("\"", "\"\"") + "\"";
+        return v;
+    };
+
+    // Provenance header — an economics export is useless without its source.
+    out << "# source=" << source_id_ << "  exported=" << QDateTime::currentDateTimeUtc().toString(Qt::ISODate)
+        << "  rows=" << all_rows_.size() << "\n";
+
+    QStringList hdrs;
+    for (const auto& c : std::as_const(columns_))
+        hdrs << quote(c);
+    out << hdrs.join(",") << "\n";
+
+    for (const auto& rv : std::as_const(all_rows_)) {
+        const QJsonObject obj = rv.toObject();
+        QStringList row;
+        for (const auto& col : std::as_const(columns_)) {
+            const QJsonValue jv = obj[col];
+            // 'g' with 15 significant digits round-trips a double without the
+            // scientific-notation truncation the UI formatter applies.
+            row << quote(jv.isDouble() ? QString::number(jv.toDouble(), 'g', 15) : jv.toString());
+        }
+        out << row.join(",") << "\n";
+    }
+}
+
+// ── Shared utilities ──────────────────────────────────────────────────────────
+
+void EconPanelBase::filter_list(QListWidget* list, const QString& text) {
+    if (!list)
+        return;
+    for (int i = 0; i < list->count(); ++i) {
+        auto* item = list->item(i);
+        item->setHidden(!item->text().contains(text, Qt::CaseInsensitive));
+    }
+}
+
+// ── i18n ──────────────────────────────────────────────────────────────────────
+
+void EconPanelBase::changeEvent(QEvent* event) {
+    if (event->type() == QEvent::LanguageChange)
+        retranslateUi();
+    QWidget::changeEvent(event);
+}
+
+void EconPanelBase::retranslateUi() {
+    // Toolbar buttons
+    if (fetch_btn_)
+        fetch_btn_->setText(tr("FETCH"));
+    if (export_btn_)
+        export_btn_->setText(tr("CSV"));
+
+    // Stat-card titles
+    if (stat_latest_lbl_)
+        stat_latest_lbl_->setText(tr("LATEST"));
+    if (stat_change_lbl_)
+        stat_change_lbl_->setText(tr("CHANGE"));
+    if (stat_min_lbl_)
+        stat_min_lbl_->setText(tr("MIN"));
+    if (stat_max_lbl_)
+        stat_max_lbl_->setText(tr("MAX"));
+    if (stat_avg_lbl_)
+        stat_avg_lbl_->setText(tr("AVG"));
+    if (stat_count_lbl_)
+        stat_count_lbl_->setText(tr("POINTS"));
+
+    // Record count (re-apply count with translated suffix)
+    if (row_count_ && !all_rows_.isEmpty())
+        row_count_->setText(latest_date_.isEmpty()
+                                ? tr("%1 records").arg(all_rows_.size())
+                                : tr("%1 records · as of %2").arg(all_rows_.size()).arg(latest_date_));
+
+    // Current status message. The empty default re-translates; loading/error
+    // messages keep the message that was last shown (data-derived prefixes are
+    // re-translated on the next fetch).
+    if (empty_lbl_ && stack_ && stack_->currentIndex() == 0) {
+        switch (status_kind_) {
+            case StatusKind::Empty:
+                empty_lbl_->setText(status_msg_);
+                break;
+            case StatusKind::Loading:
+                empty_lbl_->setText(status_msg_);
+                break;
+            case StatusKind::Error:
+                empty_lbl_->setText(tr("Error: %1").arg(status_msg_));
+                break;
+        }
+    }
+}
+
+} // namespace fincept::screens

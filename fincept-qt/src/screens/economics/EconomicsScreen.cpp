@@ -1,0 +1,391 @@
+// src/screens/economics/EconomicsScreen.cpp
+// Economics Data Explorer — panel-based shell.
+// Switches between 32 per-source EconPanelBase subclasses.
+// Panels are lazy-constructed the first time their badge is clicked.
+#include "screens/economics/EconomicsScreen.h"
+
+#include "core/logging/Logger.h"
+#include "core/session/ScreenStateManager.h"
+#include "screens/economics/panels/AdbPanel.h"
+#include "screens/economics/panels/AkShareChinaPanel.h"
+#include "screens/economics/panels/BcbPanel.h"
+#include "screens/economics/panels/BeaPanel.h"
+#include "screens/economics/panels/BisPanel.h"
+#include "screens/economics/panels/BlsPanel.h"
+#include "screens/economics/panels/CensusPanel.h"
+#include "screens/economics/panels/CftcPanel.h"
+#include "screens/economics/panels/EcbPanel.h"
+#include "screens/economics/panels/EconDbPanel.h"
+#include "screens/economics/panels/EconPanelBase.h"
+#include "screens/economics/panels/EconomicCalendarPanel.h"
+#include "screens/economics/panels/EiaPanel.h"
+#include "screens/economics/panels/EurostatPanel.h"
+#include "screens/economics/panels/FederalReservePanel.h"
+#include "screens/economics/panels/FinceptMacroPanel.h"
+#include "screens/economics/panels/FiscalDataPanel.h"
+#include "screens/economics/panels/FredAnalyticsPanel.h"
+#include "screens/economics/panels/FredPanel.h"
+#include "screens/economics/panels/GlobalCentralBanksPanel.h"
+#include "screens/economics/panels/IlostatPanel.h"
+#include "screens/economics/panels/NberPanel.h"
+#include "screens/economics/panels/ImfPanel.h"
+#include "screens/economics/panels/OecdPanel.h"
+#include "screens/economics/panels/OnsPanel.h"
+#include "screens/economics/panels/OwIdPanel.h"
+#include "screens/economics/panels/StatCanPanel.h"
+#include "screens/economics/panels/TradingEconomicsPanel.h"
+#include "screens/economics/panels/UnComtradePanel.h"
+#include "screens/economics/panels/UnescoPanel.h"
+#include "screens/economics/panels/WorldBankHealthPanel.h"
+#include "screens/economics/panels/WorldBankPanel.h"
+#include "screens/economics/panels/WtoPanel.h"
+#include "ui/theme/Theme.h"
+#include "ui/theme/ThemeManager.h"
+
+#include <QHBoxLayout>
+#include <QLabel>
+#include <QPushButton>
+#include <QScrollArea>
+#include <QSet>
+#include <QVBoxLayout>
+
+#include <iterator>
+#include <utility>
+
+namespace fincept::screens {
+
+// ── Source registry ───────────────────────────────────────────────────────────
+// { id, display label, accent color }
+static const struct {
+    const char* id;
+    const char* label;
+    const char* color;
+} kSources[] = {
+    {"worldbank", "World Bank", "#2563EB"},
+    {"imf", "IMF", "#1B5E20"},
+    {"fred", "FRED", "#B22222"},
+    {"fred_analytics", "FRED Analytics", "#C0392B"},
+    {"oecd", "OECD", "#00518A"},
+    {"ecb", "ECB", "#003F8C"},
+    {"eurostat", "Eurostat", "#003399"},
+    {"bls", "BLS", "#1565C0"},
+    {"census", "US Census", "#4527A0"},
+    {"econdb", "EconDB", "#00695C"},
+    {"trading_economics", "Trading Econ", "#FF6F00"},
+    {"econ_calendar", "Econ Calendar", "#E65100"},
+    {"bcb", "BCB Brazil", "#1B5E20"},
+    {"akshare_cn", "AkShare China", "#C62828"},
+    {"ons", "ONS UK", "#0277BD"},
+    {"global_cb", "Central Banks", "#4A148C"},
+    {"federal_reserve", "Federal Reserve", "#1A237E"},
+    {"fiscal_data", "Fiscal Data", "#006064"},
+    {"nber", "NBER Cycles", "#7C3AED"},
+    {"owid", "Our World In Data", "#6D28D9"},
+    {"statcan", "StatCan", "#B71C1C"},
+    {"ilostat", "ILO", "#0D47A1"},
+    {"un_comtrade", "UN Comtrade", "#1565C0"},
+    {"wb_health", "WB Health", "#0288D1"},
+    {"bis", "BIS", "#9D4EDD"},
+    {"adb", "ADB", "#0072BC"},
+    {"cftc", "CFTC", "#FF5722"},
+    {"eia", "EIA", "#4CAF50"},
+    {"wto", "WTO", "#E91E63"},
+    {"unesco", "UNESCO", "#00ACC1"},
+    {"bea", "BEA", "#E65100"},
+    {"fincept", "Fincept Macro", "#d97706"},
+};
+
+// ── Panel factory ─────────────────────────────────────────────────────────────
+static EconPanelBase* make_panel(const QString& id, QWidget* parent) {
+    if (id == "worldbank")
+        return new WorldBankPanel(parent);
+    if (id == "imf")
+        return new ImfPanel(parent);
+    if (id == "fred")
+        return new FredPanel(parent);
+    if (id == "fred_analytics")
+        return new FredAnalyticsPanel(parent);
+    if (id == "oecd")
+        return new OecdPanel(parent);
+    if (id == "ecb")
+        return new EcbPanel(parent);
+    if (id == "eurostat")
+        return new EurostatPanel(parent);
+    if (id == "bls")
+        return new BlsPanel(parent);
+    if (id == "census")
+        return new CensusPanel(parent);
+    if (id == "econdb")
+        return new EconDbPanel(parent);
+    if (id == "trading_economics")
+        return new TradingEconomicsPanel(parent);
+    if (id == "econ_calendar")
+        return new EconomicCalendarPanel(parent);
+    if (id == "bcb")
+        return new BcbPanel(parent);
+    if (id == "akshare_cn")
+        return new AkShareChinaPanel(parent);
+    if (id == "ons")
+        return new OnsPanel(parent);
+    if (id == "global_cb")
+        return new GlobalCentralBanksPanel(parent);
+    if (id == "federal_reserve")
+        return new FederalReservePanel(parent);
+    if (id == "fiscal_data")
+        return new FiscalDataPanel(parent);
+    if (id == "nber")
+        return new NberPanel(parent);
+    if (id == "owid")
+        return new OwIdPanel(parent);
+    if (id == "statcan")
+        return new StatCanPanel(parent);
+    if (id == "ilostat")
+        return new IlostatPanel(parent);
+    if (id == "un_comtrade")
+        return new UnComtradePanel(parent);
+    if (id == "wb_health")
+        return new WorldBankHealthPanel(parent);
+    if (id == "bis")
+        return new BisPanel(parent);
+    if (id == "adb")
+        return new AdbPanel(parent);
+    if (id == "cftc")
+        return new CftcPanel(parent);
+    if (id == "eia")
+        return new EiaPanel(parent);
+    if (id == "wto")
+        return new WtoPanel(parent);
+    if (id == "unesco")
+        return new UnescoPanel(parent);
+    if (id == "bea")
+        return new BeaPanel(parent);
+    if (id == "fincept")
+        return new FinceptMacroPanel(parent);
+    return nullptr;
+}
+
+// ── Constructor ───────────────────────────────────────────────────────────────
+
+EconomicsScreen::EconomicsScreen(QWidget* parent) : QWidget(parent) {
+    setObjectName("econScreen");
+    build_ui();
+
+    connect(&ui::ThemeManager::instance(), &ui::ThemeManager::theme_changed, this, &EconomicsScreen::refresh_theme);
+
+    // Activate first source
+    if (!sources_.isEmpty())
+        switch_to(sources_.first().id);
+}
+
+void EconomicsScreen::build_ui() {
+    auto* root = new QVBoxLayout(this);
+    root->setContentsMargins(0, 0, 0, 0);
+    root->setSpacing(0);
+
+    // ── Header ────────────────────────────────────────────────────────────────
+    header_ = new QWidget(this);
+    header_->setFixedHeight(40);
+    auto* hl = new QHBoxLayout(header_);
+    hl->setContentsMargins(12, 0, 12, 0);
+    hl->setSpacing(8);
+
+    title_ = new QLabel(tr("ECONOMICS DATA EXPLORER"));
+    // Derive the count from the registry — the hard-coded "32" was one more
+    // than the number of panels actually registered.
+    subtitle_ = new QLabel(tr("%1 global data sources · 1000+ indicators").arg(static_cast<int>(std::size(kSources))));
+
+    hl->addWidget(title_);
+    hl->addWidget(subtitle_);
+    hl->addStretch();
+    root->addWidget(header_);
+
+    // ── Badge bar (scrollable) ────────────────────────────────────────────────
+    scroll_ = new QScrollArea;
+    scroll_->setAccessibleName(tr("Economics data source selector"));
+    scroll_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    scroll_->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    scroll_->setFixedHeight(34);
+    scroll_->setWidgetResizable(true);
+    scroll_->setFrameShape(QFrame::NoFrame);
+
+    badge_bar_ = new QWidget(this);
+    badge_bar_->setObjectName(QStringLiteral("econBadgeBar"));
+    auto* bhl = new QHBoxLayout(badge_bar_);
+    bhl->setContentsMargins(6, 3, 6, 3);
+    bhl->setSpacing(4);
+
+    for (const auto& src : kSources) {
+        SourceEntry entry;
+        entry.id = src.id;
+        entry.label = src.label;
+        entry.color = src.color;
+
+        auto* btn = new QPushButton(src.label);
+        btn->setObjectName(QStringLiteral("econBadge_") + src.id); // styled by the badge bar's stylesheet
+        btn->setCheckable(true);
+        btn->setFixedHeight(26);
+        btn->setAccessibleName(tr("Data source: %1").arg(QString::fromUtf8(src.label)));
+        btn->setToolTip(tr("Switch to the %1 data source").arg(QString::fromUtf8(src.label)));
+
+        const QString sid = src.id;
+        connect(btn, &QPushButton::clicked, this, [this, sid]() { switch_to(sid); });
+
+        entry.badge = btn;
+        bhl->addWidget(btn);
+        sources_.append(entry);
+    }
+    bhl->addStretch();
+
+    // Left-to-right keyboard traversal across the source badges.
+    for (int i = 1; i < sources_.size(); ++i)
+        QWidget::setTabOrder(sources_[i - 1].badge, sources_[i].badge);
+
+    scroll_->setWidget(badge_bar_);
+    root->addWidget(scroll_);
+
+    // ── Panel stack ───────────────────────────────────────────────────────────
+    stack_ = new QStackedWidget;
+    root->addWidget(stack_, 1);
+
+    // Apply initial theme
+    refresh_theme();
+}
+
+// ── Theme refresh ─────────────────────────────────────────────────────────────
+
+void EconomicsScreen::refresh_theme() {
+    using namespace ui::colors;
+
+    header_->setStyleSheet(QString("background:%1; border-bottom:1px solid %2;").arg(BG_BASE(), BORDER_DIM()));
+
+    title_->setStyleSheet(QString("color:%1; font-size:12px; font-weight:700;"
+                                  "letter-spacing:1.5px; background:transparent;")
+                              .arg(TEXT_PRIMARY()));
+
+    subtitle_->setStyleSheet(QString("color:%1; font-size:10px; background:transparent;").arg(TEXT_TERTIARY()));
+
+    scroll_->setStyleSheet(QString("background:%1; border-bottom:1px solid %2;").arg(BG_BASE(), BORDER_DIM()));
+
+    // Style every source badge with ONE stylesheet on the badge bar (id selectors per badge).
+    // Calling setStyleSheet() on each of the badges re-parsed and re-polished all of them on every
+    // theme change.
+    QString badge_qss = QString("#econBadgeBar { background:%1; }").arg(BG_BASE());
+    for (const auto& entry : sources_) {
+        const QColor c(entry.color);
+        const QString rgba = QString("%1,%2,%3").arg(c.red()).arg(c.green()).arg(c.blue());
+        badge_qss += QString("#econBadge_%1 { background:%2; color:%3; border:1px solid %4;"
+                             "  font-size:9px; font-weight:700; padding:0 10px; letter-spacing:0.3px; }"
+                             "#econBadge_%1:hover { color:%5; border-color:%6; }"
+                             "#econBadge_%1:checked { background:rgba(%7,0.12); color:%8;"
+                             "  border-color:%8; }")
+                         .arg(entry.id, BG_SURFACE(), TEXT_TERTIARY(), BORDER_DIM(), TEXT_PRIMARY(), BORDER_BRIGHT())
+                         .arg(rgba, entry.color);
+    }
+    badge_bar_->setStyleSheet(badge_qss);
+
+    stack_->setStyleSheet(QString("background:%1;").arg(BG_BASE()));
+}
+
+// ── i18n ──────────────────────────────────────────────────────────────────────
+
+void EconomicsScreen::changeEvent(QEvent* event) {
+    if (event->type() == QEvent::LanguageChange)
+        retranslateUi();
+    QWidget::changeEvent(event);
+}
+
+void EconomicsScreen::retranslateUi() {
+    if (title_)
+        title_->setText(tr("ECONOMICS DATA EXPLORER"));
+    if (subtitle_)
+        subtitle_->setText(
+            tr("%1 global data sources · 1000+ indicators").arg(static_cast<int>(std::size(kSources))));
+    // Source badge labels are brand/source names (data) and are not translated.
+}
+
+// ── Panel switching ───────────────────────────────────────────────────────────
+
+EconPanelBase* EconomicsScreen::get_or_create_panel(SourceEntry& entry) {
+    if (entry.panel)
+        return entry.panel;
+
+    EconPanelBase* panel = make_panel(entry.id, nullptr);
+    if (!panel) {
+        LOG_ERROR("EconomicsScreen", "No panel factory for source: " + entry.id);
+        return nullptr;
+    }
+
+    entry.panel = panel;
+    stack_->addWidget(panel);
+    LOG_INFO("EconomicsScreen", "Created panel for: " + entry.id);
+
+    // Apply the state saved for this panel (restore_state() ran before the panel existed).
+    const QString state_key = entry.id + "_panel";
+    if (pending_panel_states_.contains(state_key))
+        panel->restore_panel_state(pending_panel_states_.take(state_key).toMap());
+    return panel;
+}
+
+void EconomicsScreen::switch_to(const QString& source_id) {
+    if (active_id_ == source_id)
+        return;
+    active_id_ = source_id;
+    ScreenStateManager::instance().notify_changed(this);
+
+    for (auto& entry : sources_) {
+        if (entry.badge)
+            static_cast<QPushButton*>(entry.badge)->setChecked(entry.id == source_id);
+
+        if (entry.id == source_id) {
+            EconPanelBase* panel = get_or_create_panel(entry);
+            if (panel) {
+                stack_->setCurrentWidget(panel);
+                // activate() resets a panel to its intro text. Skip it when the panel is showing
+                // data (or waiting on a request) so switching sources doesn't throw results away.
+                if (!panel->keeps_state_on_activate())
+                    panel->activate();
+            }
+        }
+    }
+}
+
+// ── IStatefulScreen ───────────────────────────────────────────────────────────
+
+QVariantMap EconomicsScreen::save_state() const {
+    // Start from the saved state of panels not built this session, so saving after opening only
+    // some panels doesn't drop everyone else's inputs.
+    QVariantMap state = pending_panel_states_;
+    state["source_id"] = active_id_;
+    for (const auto& entry : sources_) {
+        if (entry.panel) {
+            auto ps = entry.panel->save_panel_state();
+            if (!ps.isEmpty())
+                state[entry.id + "_panel"] = ps;
+        }
+    }
+    return state;
+}
+
+void EconomicsScreen::restore_state(const QVariantMap& state) {
+    // Panels are lazy: queue the state of the ones that don't exist yet BEFORE switching, so the
+    // target panel is built with its restored inputs already in place (and is not activated with
+    // defaults first), then apply to panels that already exist.
+    QSet<QString> queued;
+    for (const auto& entry : std::as_const(sources_)) {
+        const QString key = entry.id + "_panel";
+        if (!entry.panel && state.contains(key)) {
+            pending_panel_states_[key] = state.value(key);
+            queued.insert(key);
+        }
+    }
+    const QString id = state.value("source_id").toString();
+    if (!id.isEmpty())
+        switch_to(id);
+    for (auto& entry : sources_) {
+        const QString key = entry.id + "_panel";
+        if (entry.panel && state.contains(key) && !queued.contains(key))
+            entry.panel->restore_panel_state(state.value(key).toMap());
+    }
+}
+
+} // namespace fincept::screens

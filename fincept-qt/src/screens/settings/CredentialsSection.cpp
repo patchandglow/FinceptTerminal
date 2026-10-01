@@ -1,0 +1,333 @@
+// CredentialsSection.cpp — API credential entry cards backed by SecureStorage.
+
+#include "screens/settings/CredentialsSection.h"
+
+#include "core/logging/Logger.h"
+#include "screens/settings/SettingsRowHelpers.h"
+#include "screens/settings/SettingsStyles.h"
+#include "storage/secure/SecureStorage.h"
+#include "ui/theme/Theme.h"
+
+#include <QFrame>
+#include <QHBoxLayout>
+#include <QLabel>
+#include <QLineEdit>
+#include <QList>
+#include <QMessageBox>
+#include <QPair>
+#include <QPushButton>
+#include <QScrollArea>
+#include <QShowEvent>
+#include <QString>
+#include <QVBoxLayout>
+
+namespace fincept::screens {
+
+namespace {
+
+using CredDef = QPair<QString, QString>; // {env_key, display_name}
+const QList<CredDef> CRED_KEYS = {
+    {"ALPHA_VANTAGE_API_KEY", "Alpha Vantage"},
+    {"POLYGON_API_KEY", "Polygon.io"},
+    {"DATABENTO_API_KEY", "Databento"},
+    {"FRED_API_KEY", "FRED (Federal Reserve)"},
+    {"NEWSAPI_KEY", "NewsAPI"},
+    {"BINANCE_API_KEY", "Binance API Key"},
+    {"BINANCE_SECRET_KEY", "Binance Secret Key"},
+    {"KRAKEN_API_KEY", "Kraken API Key"},
+    {"KRAKEN_SECRET_KEY", "Kraken Secret Key"},
+    {"IEX_CLOUD_TOKEN", "IEX Cloud Token"},
+    {"FINNHUB_API_KEY", "Finnhub API Key"},
+    {"TIINGO_API_KEY", "Tiingo API Key"},
+    {"QUANDL_API_KEY", "Quandl"},
+    {"POLYMARKET_API_KEY", "Polymarket API Key"},
+    {"POLYMARKET_SECRET", "Polymarket Secret"},
+    {"POLYMARKET_PASSPHRASE", "Polymarket Passphrase"},
+    {"POLYMARKET_WALLET", "Polymarket Wallet Address"},
+// Keyed data-connector provider keys (auto-generated; one entry card each).
+// Kept in sync with PythonRunner.cpp kManagedCredentialKeys via the shared
+// X-macro include below.
+#define FINCEPT_KEYED_CRED(KEY, NAME) {KEY, NAME}, // NOLINT(cppcoreguidelines-macro-usage) — X-macro list expansion
+#include "config/KeyedConnectorCredentials.inc"
+#undef FINCEPT_KEYED_CRED
+};
+
+// One place for the per-key status line's state colour. The handlers used to
+// call setStyleSheet() inline in every branch (five copies).
+void cred_set_status(QLabel* status, const QString& text, const QString& color) {
+    status->setText(text);
+    status->setStyleSheet(QString("color:%1;background:transparent;").arg(color));
+}
+
+} // namespace
+
+CredentialsSection::CredentialsSection(QWidget* parent) : QWidget(parent) {
+    build_ui();
+}
+
+void CredentialsSection::showEvent(QShowEvent* e) {
+    QWidget::showEvent(e);
+    reload();
+}
+
+void CredentialsSection::build_ui() {
+    using namespace settings_styles;
+    using namespace settings_helpers;
+
+    auto* root = new QVBoxLayout(this);
+    root->setContentsMargins(0, 0, 0, 0);
+    root->setSpacing(0);
+
+    auto* scroll = new QScrollArea;
+    scroll->setWidgetResizable(true);
+    scroll->setStyleSheet(QString("QScrollArea{border:none;background:transparent;}"
+                                  "QScrollBar:vertical{width:6px;background:transparent;}"
+                                  "QScrollBar::handle:vertical{background:%1;border-radius:3px;}"
+                                  "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;}")
+                              .arg(ui::colors::BORDER_MED()));
+
+    auto* page = new QWidget(this);
+    auto* vl = new QVBoxLayout(page);
+    vl->setContentsMargins(24, 24, 24, 24);
+    vl->setSpacing(0);
+
+    title_ = new QLabel(tr("API CREDENTIALS"));
+    title_->setStyleSheet(section_title_ss());
+    vl->addWidget(title_);
+    vl->addSpacing(4);
+
+    info_ = new QLabel(tr("Store API keys securely in the OS keychain. Keys are never written to disk in plain text."));
+    info_->setWordWrap(true);
+    info_->setStyleSheet(QString("color:%1;background:transparent;").arg(ui::colors::TEXT_SECONDARY()));
+    vl->addWidget(info_);
+    vl->addSpacing(16);
+    vl->addWidget(make_sep());
+    vl->addSpacing(16);
+
+    // One page-level stylesheet keyed by objectName instead of ~6 inline
+    // setStyleSheet() calls per credential card. With 60+ providers in
+    // CRED_KEYS that was 350+ CSS parses every time this section is built —
+    // and SettingsScreen builds all 16 sections eagerly. Only the per-key
+    // status label keeps an inline style, because its colour is state-driven.
+    page->setStyleSheet(QString("QFrame#credCard{background:%1;border:1px solid %2;}"
+                                "QWidget#credHdr{background:%3;border-bottom:1px solid %2;}"
+                                "QLabel#credName{color:%4;font-weight:600;background:transparent;}"
+                                "QWidget#credBody{background:transparent;}"
+                                "QLineEdit#credField,QLineEdit#credFilter{background:%3;color:%4;"
+                                "border:1px solid %5;padding:6px;}"
+                                "QLineEdit#credField:focus,QLineEdit#credFilter:focus{border:1px solid %6;}"
+                                "QLabel#credEmpty{color:%9;background:transparent;}"
+                                "QPushButton#credSave{background:%6;color:%7;border:none;font-weight:700;"
+                                "padding:0 16px;}"
+                                "QPushButton#credSave:hover{background:%8;}")
+                            .arg(ui::colors::BG_SURFACE(), ui::colors::BORDER_DIM(), ui::colors::BG_RAISED(),
+                                 ui::colors::TEXT_PRIMARY(), ui::colors::BORDER_MED(), ui::colors::AMBER(),
+                                 ui::colors::BG_BASE(), ui::colors::AMBER_DIM(), ui::colors::TEXT_DIM()));
+
+    // ~130 provider cards: finding one by scrolling is hopeless, and the Settings
+    // nav search only reaches this section, not a card inside it.
+    filter_edit_ = new QLineEdit;
+    filter_edit_->setObjectName(QStringLiteral("credFilter"));
+    filter_edit_->setPlaceholderText(tr("Filter providers..."));
+    filter_edit_->setClearButtonEnabled(true);
+    filter_edit_->setAccessibleName(tr("Filter credential providers"));
+    connect(filter_edit_, &QLineEdit::textChanged, this, &CredentialsSection::apply_filter);
+    vl->addWidget(filter_edit_);
+    vl->addSpacing(12);
+
+    no_match_lbl_ = new QLabel(tr("No provider matches the filter."));
+    no_match_lbl_->setObjectName(QStringLiteral("credEmpty"));
+    no_match_lbl_->hide();
+    vl->addWidget(no_match_lbl_);
+
+    for (const auto& def : CRED_KEYS) {
+        const QString& key = def.first;
+        const QString& name = def.second;
+
+        auto* card = new QFrame;
+        card->setObjectName(QStringLiteral("credCard"));
+        auto* cvl = new QVBoxLayout(card);
+        cvl->setContentsMargins(0, 0, 0, 0);
+        cvl->setSpacing(0);
+
+        auto* hdr = new QWidget(this);
+        hdr->setObjectName(QStringLiteral("credHdr"));
+        hdr->setFixedHeight(34);
+        auto* hhl = new QHBoxLayout(hdr);
+        hhl->setContentsMargins(12, 0, 12, 0);
+        auto* name_lbl = new QLabel(name);
+        name_lbl->setObjectName(QStringLiteral("credName"));
+        hhl->addWidget(name_lbl);
+        hhl->addStretch();
+
+        auto* status_lbl = new QLabel;
+        cred_set_status(status_lbl, tr("Not set"), ui::colors::TEXT_SECONDARY());
+        hhl->addWidget(status_lbl);
+        cred_status_[key] = status_lbl;
+
+        cvl->addWidget(hdr);
+
+        auto* body = new QWidget(this);
+        body->setObjectName(QStringLiteral("credBody"));
+        auto* bhl = new QHBoxLayout(body);
+        bhl->setContentsMargins(12, 10, 12, 10);
+        bhl->setSpacing(8);
+
+        auto* field = new QLineEdit;
+        field->setObjectName(QStringLiteral("credField"));
+        field->setEchoMode(QLineEdit::Password);
+        field->setPlaceholderText(tr("Not configured"));
+        // Never let an API key end up in an IME candidate list, a predictive
+        // dictionary, or a drag-and-drop payload.
+        field->setInputMethodHints(Qt::ImhSensitiveData | Qt::ImhNoPredictiveText | Qt::ImhNoAutoUppercase);
+        field->setDragEnabled(false);
+        field->setAcceptDrops(false);
+        field->setAccessibleName(tr("%1 API key").arg(name));
+        cred_fields_[key] = field;
+        bhl->addWidget(field, 1);
+
+        auto* save_btn = new QPushButton(tr("Save"));
+        save_btn->setObjectName(QStringLiteral("credSave"));
+        save_btn->setFixedHeight(30);
+        save_btn->setFixedWidth(70);
+        save_btn->setAccessibleName(tr("Save %1 API key").arg(name));
+        bhl->addWidget(save_btn);
+        cred_save_btns_[key] = save_btn;
+
+        // Enter in the field is the same as clicking Save.
+        connect(field, &QLineEdit::returnPressed, save_btn, &QPushButton::click);
+        setTabOrder(field, save_btn);
+
+        connect(save_btn, &QPushButton::clicked, this, [this, key, name, field, status_lbl]() {
+            QString val = field->text().trimmed();
+            if (val.isEmpty()) {
+                // Saving an empty field deletes the stored key. That is a
+                // destructive, silent action when a key is already configured —
+                // confirm it rather than shredding a credential on a stray click.
+                const auto existing = SecureStorage::instance().retrieve(key);
+                const bool had_key = existing.is_ok() && !existing.value().isEmpty();
+                if (had_key) {
+                    const auto reply = QMessageBox::question(
+                        this, tr("Remove Credential"),
+                        tr("Remove the stored %1 key from the OS keychain?\n\nYou will need to paste it "
+                           "again to restore access.")
+                            .arg(name),
+                        QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+                    if (reply != QMessageBox::Yes)
+                        return;
+                }
+                const auto removed = SecureStorage::instance().remove(key);
+                if (removed.is_err()) {
+                    // The result was ignored, so "Cleared" was shown even when the
+                    // key was still in the keychain and still being injected into
+                    // every Python subprocess.
+                    cred_set_status(status_lbl, tr("Clear failed"), ui::colors::NEGATIVE());
+                    LOG_ERROR("Credentials", "Failed to clear " + key);
+                    return;
+                }
+                field->setPlaceholderText(tr("Not configured"));
+                cred_set_status(status_lbl, tr("Cleared"), ui::colors::TEXT_SECONDARY());
+                LOG_INFO("Credentials", "Cleared key: " + key);
+            } else {
+                auto r = SecureStorage::instance().store(key, val);
+                if (r.is_ok()) {
+                    field->clear();
+                    field->setPlaceholderText(tr("•••••••• (saved)"));
+                    cred_set_status(status_lbl, tr("Saved ✓"), ui::colors::POSITIVE());
+                    LOG_INFO("Credentials", "Stored key: " + key);
+                } else {
+                    cred_set_status(status_lbl, tr("Save failed"), ui::colors::NEGATIVE());
+                    LOG_ERROR("Credentials", "Failed to store " + key);
+                }
+            }
+        });
+
+        cvl->addWidget(body);
+
+        // Each card sits in a wrapper that carries the 8px gap, so hiding the
+        // wrapper (see apply_filter) also hides the gap — a bare addSpacing()
+        // would pile up as blank space once most cards are filtered out.
+        auto* wrap = new QWidget(this);
+        auto* wrap_lay = new QVBoxLayout(wrap);
+        wrap_lay->setContentsMargins(0, 0, 0, 8);
+        wrap_lay->setSpacing(0);
+        wrap_lay->addWidget(card);
+        vl->addWidget(wrap);
+        cred_cards_[key] = wrap;
+    }
+
+    vl->addStretch();
+    scroll->setWidget(page);
+    root->addWidget(scroll);
+}
+
+void CredentialsSection::reload() {
+    for (auto it = cred_fields_.constBegin(); it != cred_fields_.constEnd(); ++it) {
+        const QString& key = it.key();
+        auto* field = it.value();
+        auto* status = cred_status_.value(key, nullptr);
+        if (!field || !status)
+            continue;
+
+        auto r = SecureStorage::instance().retrieve(key);
+        if (r.is_ok() && !r.value().isEmpty()) {
+            field->clear();
+            field->setPlaceholderText(tr("•••••••• (saved)"));
+            cred_set_status(status, tr("Saved ✓"), ui::colors::POSITIVE());
+        } else {
+            field->clear();
+            field->setPlaceholderText(tr("Not configured"));
+            cred_set_status(status, tr("Not set"), ui::colors::TEXT_SECONDARY());
+        }
+    }
+}
+
+void CredentialsSection::apply_filter(const QString& text) {
+    const QString needle = text.trimmed();
+    int visible = 0;
+    for (const auto& def : CRED_KEYS) {
+        auto* card = cred_cards_.value(def.first, nullptr);
+        if (!card)
+            continue;
+        const bool match = needle.isEmpty() || def.second.contains(needle, Qt::CaseInsensitive) ||
+                           def.first.contains(needle, Qt::CaseInsensitive);
+        card->setVisible(match);
+        if (match)
+            ++visible;
+    }
+    if (no_match_lbl_)
+        no_match_lbl_->setVisible(visible == 0);
+}
+
+void CredentialsSection::changeEvent(QEvent* event) {
+    if (event->type() == QEvent::LanguageChange)
+        retranslateUi();
+    QWidget::changeEvent(event);
+}
+
+void CredentialsSection::retranslateUi() {
+    if (title_)
+        title_->setText(tr("API CREDENTIALS"));
+    if (info_)
+        info_->setText(tr("Store API keys securely in the OS keychain. Keys are never written to disk in plain text."));
+    if (filter_edit_) {
+        filter_edit_->setPlaceholderText(tr("Filter providers..."));
+        filter_edit_->setAccessibleName(tr("Filter credential providers"));
+    }
+    if (no_match_lbl_)
+        no_match_lbl_->setText(tr("No provider matches the filter."));
+
+    // Per-credential Save buttons. (Credential names are product/brand names —
+    // not translated. Provider name labels stay as-is.)
+    for (auto it = cred_save_btns_.constBegin(); it != cred_save_btns_.constEnd(); ++it) {
+        if (it.value())
+            it.value()->setText(tr("Save"));
+    }
+
+    // reload() re-applies state-dependent placeholders ("Not configured" /
+    // "•••••••• (saved)") and status labels ("Not set" / "Saved ✓") in the
+    // current language.
+    reload();
+}
+
+} // namespace fincept::screens

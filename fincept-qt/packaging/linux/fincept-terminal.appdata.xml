@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.fincept.terminal</id>
+  <name>Fincept Terminal</name>
+  <summary>Professional financial intelligence terminal</summary>
+  <metadata_license>FSFAP</metadata_license>
+  <project_license>AGPL-3.0-or-later</project_license>
+  <description>
+    <p>
+      Fincept Terminal is a native C++ desktop financial intelligence terminal
+      featuring real-time market data, AI-powered analytics, multi-broker trading,
+      portfolio management, and 1300+ Python analytics scripts.
+    </p>
+    <ul>
+      <li>Real-time crypto and equity trading (Kraken, HyperLiquid, 18+ brokers)</li>
+      <li>AI chat with multiple LLM providers (OpenAI, Anthropic, Groq, Ollama)</li>
+      <li>Python analytics (equity, derivatives, fixed income, quant)</li>
+      <li>Voice commands via offline Whisper speech recognition</li>
+      <li>Visual workflow node editor with risk management</li>
+      <li>Geopolitics, prediction markets (Polymarket), maritime tracking</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">fincept-terminal.desktop</launchable>
+  <url type="homepage">https://github.com/Fincept-Corporation/FinceptTerminal</url>
+  <url type="bugtracker">https://github.com/Fincept-Corporation/FinceptTerminal/issues</url>
+  <url type="help">https://discord.gg/ae87a8ygbN</url>
+  <provides>
+    <binary>FinceptTerminal</binary>
+  </provides>
+  <releases>
+    <release version="4.5.0" date="2026-08-31">
+      <description>
+        <p>Version 4.5.0 — Fixes AI tool calling with Google Gemini: around 150 tools that take a free-form options object were being advertised to Gemini as taking no arguments, so they could be called but never given any input. The assistant now runs a turn's independent tool calls in parallel, while tools that change something still run in order. Long-running work (backtests, quant modules, agent runs) hands back a job you can watch and cancel instead of freezing the conversation, now across ~190 tools rather than a dozen. Tool sequences gain a time limit alongside the step limit and report which ran out. Fixes the AstraFlow providers failing to resolve their endpoint when the base URL was cleared.</p>
+      </description>
+    </release>
+    <release version="4.4.1" date="2026-08-19">
+      <description>
+        <p>Version 4.4.1 — Adds the TickerAll (MetaTrader 5) broker integration for linking and trading MT5 accounts. Python runtime provisioning is more reliable on first run, and the unused FinRL analytics module and its heavy dependencies have been removed.</p>
+      </description>
+    </release>
+    <release version="4.4.0" date="2026-08-11">
+      <description>
+        <p>Version 4.4.0 — Correctness and safety release. Failed data fetches, unreadable settings and incomplete option chains now report an error instead of rendering as confident numbers. Risk limits, order rate limits and the smart/basket order validators are enforced rather than merely configurable. Destructive AI tools are off by default (Settings &gt; Security), live orders require explicit confirmation, and the update manifest is signature-verified.</p>
+      </description>
+    </release>
+    <release version="4.3.0" date="2026-07-25">
+      <description>
+        <p>Version 4.3.0 — MCP long-running tools now run as background jobs the assistant can poll and cancel, and oversized tool results are paged on demand instead of filling the conversation.</p>
+      </description>
+    </release>
+    <release version="4.1.0" date="2026-06-09">
+      <description>
+        <p>Version 4.1.0 — Optional NewsAPI.org news provider, broker-sourced technicals, and fixes.</p>
+      </description>
+    </release>
+    <release version="4.0.2" date="2026-04-14">
+      <description>
+        <p>Version 4.0.2 — Patch release.</p>
+      </description>
+    </release>
+    <release version="4.0.0" date="2025-01-01">
+      <description>
+        <p>Version 4.0.0 — Complete rewrite in native C++20 with Qt6.</p>
+      </description>
+    </release>
+  </releases>
+  <content_rating type="oars-1.1"/>
+  <categories>
+    <category>Finance</category>
+    <category>Office</category>
+  </categories>
+</component>

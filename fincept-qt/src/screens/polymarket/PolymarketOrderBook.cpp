@@ -1,0 +1,258 @@
+#include "screens/polymarket/PolymarketOrderBook.h"
+
+#include "ui/theme/Theme.h"
+#include "ui/theme/ThemeManager.h"
+
+#include <QMouseEvent>
+#include <QPainter>
+#include <QVBoxLayout>
+
+#include <algorithm>
+
+namespace fincept::screens::polymarket {
+
+using namespace fincept::ui;
+using namespace fincept::services::prediction;
+
+PolymarketOrderBook::PolymarketOrderBook(QWidget* parent) : QWidget(parent) {
+    setMinimumHeight(200);
+    setAccessibleName(tr("Order book"));
+    setToolTip(tr("Click a price level to load it into the trade ticket."));
+
+    connect(&ui::ThemeManager::instance(), &ui::ThemeManager::theme_changed, this, [this](const ui::ThemeTokens&) {
+        cache_dirty_ = true;
+        update();
+    });
+
+    repaint_timer_ = new QTimer(this);
+    repaint_timer_->setInterval(50); // 20fps max
+    connect(repaint_timer_, &QTimer::timeout, this, [this]() {
+        if (cache_dirty_) {
+            rebuild_cache();
+            update();
+        }
+    });
+}
+
+void PolymarketOrderBook::set_data(const PredictionOrderBook& book) {
+    QMutexLocker lock(&mutex_);
+    bids_ = book.bids;
+    asks_ = book.asks;
+    // Fixed 2 dp rendered a 0.001-tick market's 0.525 / 0.526 levels both as "0.53" and
+    // made its click-to-price rounding invisible. 0 = tick unknown: keep the last value.
+    if (book.tick_size >= 0.01)
+        price_decimals_ = 2;
+    else if (book.tick_size >= 0.001)
+        price_decimals_ = 3;
+    else if (book.tick_size > 0.0)
+        price_decimals_ = 4;
+
+    // Calculate spread
+    double best_bid = bids_.isEmpty() ? 0 : bids_[0].price;
+    double best_ask = asks_.isEmpty() ? 0 : asks_[0].price;
+    spread_ = (best_bid > 0 && best_ask > 0) ? (best_ask - best_bid) : 0;
+
+    cache_dirty_ = true;
+}
+
+void PolymarketOrderBook::clear() {
+    QMutexLocker lock(&mutex_);
+    bids_.clear();
+    asks_.clear();
+    spread_ = 0;
+    cache_dirty_ = true;
+    update();
+}
+
+void PolymarketOrderBook::showEvent(QShowEvent* e) {
+    QWidget::showEvent(e);
+    repaint_timer_->start();
+}
+
+void PolymarketOrderBook::hideEvent(QHideEvent* e) {
+    QWidget::hideEvent(e);
+    repaint_timer_->stop();
+}
+
+void PolymarketOrderBook::resizeEvent(QResizeEvent* e) {
+    QWidget::resizeEvent(e);
+    cache_dirty_ = true;
+}
+
+void PolymarketOrderBook::paintEvent(QPaintEvent*) {
+    if (cache_dirty_)
+        rebuild_cache();
+    QPainter p(this);
+    p.drawPixmap(0, 0, cache_);
+}
+
+void PolymarketOrderBook::mousePressEvent(QMouseEvent* event) {
+    int y = event->pos().y();
+    if (y < HEADER_HEIGHT)
+        return;
+
+    // Resolve which price level was clicked using the SAME visible-row counts the
+    // painter used, otherwise a click lands on a different level than the one
+    // drawn (which, for a trading order book, fills the order form with a wrong
+    // price). Compute under the lock, then emit outside it so a slot that calls
+    // back into set_data()/clear() can't deadlock on mutex_.
+    double clicked_price = 0.0;
+    bool has_click = false;
+    {
+        QMutexLocker lock(&mutex_);
+        int row_idx = (y - HEADER_HEIGHT) / ROW_HEIGHT;
+        int ask_rows = 0, bid_rows = 0;
+        visible_row_counts(ask_rows, bid_rows);
+
+        if (row_idx < ask_rows) {
+            // Asks are painted highest-first (reversed), so the top row is the
+            // last ask index and the row just above the spread is asks_[0].
+            int ask_i = ask_rows - 1 - row_idx;
+            if (ask_i >= 0 && ask_i < asks_.size()) {
+                clicked_price = asks_[ask_i].price;
+                has_click = true;
+            }
+        } else {
+            int bid_idx = row_idx - ask_rows - 1; // -1 for the spread row
+            if (bid_idx >= 0 && bid_idx < bid_rows && bid_idx < bids_.size()) {
+                clicked_price = bids_[bid_idx].price;
+                has_click = true;
+            }
+        }
+    }
+    if (has_click)
+        emit price_clicked(clicked_price);
+}
+
+void PolymarketOrderBook::visible_row_counts(int& ask_rows, int& bid_rows) const {
+    const int h = height();
+    const int max_rows = (h - HEADER_HEIGHT) / ROW_HEIGHT;
+    ask_rows = qMin(asks_.size(), qMax(1, max_rows / 2 - 1));
+    bid_rows = qMin(bids_.size(), qMax(1, max_rows / 2 - 1));
+}
+
+void PolymarketOrderBook::rebuild_cache() {
+    QMutexLocker lock(&mutex_);
+    cache_dirty_ = false;
+
+    int w = width();
+    int h = height();
+    if (w <= 0 || h <= 0)
+        return;
+
+    cache_ = QPixmap(w, h);
+    cache_.fill(QColor(colors::BG_BASE()));
+    QPainter p(&cache_);
+    p.setRenderHint(QPainter::Antialiasing, false);
+
+    QFont header_font(fonts::DATA_FAMILY, 8);
+    header_font.setWeight(QFont::Bold);
+    QFont data_font(fonts::DATA_FAMILY, 9);
+
+    // Header
+    p.fillRect(0, 0, w, HEADER_HEIGHT, QColor(colors::BG_RAISED()));
+    p.setPen(QColor(colors::BORDER_DIM()));
+    p.drawLine(0, HEADER_HEIGHT - 1, w, HEADER_HEIGHT - 1);
+    p.setFont(header_font);
+    p.setPen(QColor(colors::TEXT_SECONDARY()));
+    int col_w = w / 3;
+    p.drawText(8, 0, col_w, HEADER_HEIGHT, Qt::AlignLeft | Qt::AlignVCenter, tr("PRICE"));
+    p.drawText(col_w, 0, col_w, HEADER_HEIGHT, Qt::AlignRight | Qt::AlignVCenter, tr("SIZE"));
+    p.drawText(2 * col_w, 0, col_w - 8, HEADER_HEIGHT, Qt::AlignRight | Qt::AlignVCenter, tr("TOTAL"));
+
+    // Separator
+    p.setPen(QColor(colors::BORDER_DIM()));
+    p.drawLine(0, HEADER_HEIGHT - 1, w, HEADER_HEIGHT - 1);
+
+    int ask_rows = 0, bid_rows = 0;
+    visible_row_counts(ask_rows, bid_rows);
+
+    // Find max cumulative size for depth bars
+    double max_depth = 0;
+    double cum = 0;
+    for (int i = 0; i < ask_rows; ++i) {
+        cum += asks_[i].size;
+        max_depth = qMax(max_depth, cum);
+    }
+    cum = 0;
+    for (int i = 0; i < bid_rows; ++i) {
+        cum += bids_[i].size;
+        max_depth = qMax(max_depth, cum);
+    }
+    if (max_depth == 0)
+        max_depth = 1;
+
+    p.setFont(data_font);
+    int y = HEADER_HEIGHT;
+
+    // Asks (highest first → reversed)
+    cum = 0;
+    for (int i = ask_rows - 1; i >= 0; --i) {
+        cum += asks_[i].size;
+        double depth_pct = cum / max_depth;
+        int bar_w = static_cast<int>(w * depth_pct);
+
+        p.fillRect(w - bar_w, y, bar_w, ROW_HEIGHT, QColor(220, 38, 38, 25));
+
+        p.setPen(QColor(colors::NEGATIVE()));
+        p.drawText(4, y, col_w, ROW_HEIGHT, Qt::AlignLeft | Qt::AlignVCenter,
+                   QString::number(asks_[i].price, 'f', price_decimals_));
+        p.setPen(QColor(colors::TEXT_SECONDARY()));
+        p.drawText(col_w, y, col_w, ROW_HEIGHT, Qt::AlignRight | Qt::AlignVCenter,
+                   QString::number(asks_[i].size, 'f', 1));
+        p.drawText(2 * col_w, y, col_w - 4, ROW_HEIGHT, Qt::AlignRight | Qt::AlignVCenter,
+                   QString::number(cum, 'f', 1));
+
+        p.setPen(QColor(colors::BORDER_DIM()));
+        p.drawLine(0, y + ROW_HEIGHT - 1, w, y + ROW_HEIGHT - 1);
+        y += ROW_HEIGHT;
+    }
+
+    // Spread row
+    p.fillRect(0, y, w, ROW_HEIGHT, QColor(colors::BG_RAISED()));
+    p.setPen(QColor(colors::AMBER()));
+    p.setFont(header_font);
+    p.drawText(4, y, w - 8, ROW_HEIGHT, Qt::AlignCenter, tr("SPREAD %1").arg(QString::number(spread_, 'f', 4)));
+    y += ROW_HEIGHT;
+
+    // Bids (highest first)
+    p.setFont(data_font);
+    cum = 0;
+    for (int i = 0; i < bid_rows; ++i) {
+        cum += bids_[i].size;
+        double depth_pct = cum / max_depth;
+        int bar_w = static_cast<int>(w * depth_pct);
+
+        p.fillRect(w - bar_w, y, bar_w, ROW_HEIGHT, QColor(22, 163, 74, 25));
+
+        p.setPen(QColor(colors::POSITIVE()));
+        p.drawText(4, y, col_w, ROW_HEIGHT, Qt::AlignLeft | Qt::AlignVCenter,
+                   QString::number(bids_[i].price, 'f', price_decimals_));
+        p.setPen(QColor(colors::TEXT_SECONDARY()));
+        p.drawText(col_w, y, col_w, ROW_HEIGHT, Qt::AlignRight | Qt::AlignVCenter,
+                   QString::number(bids_[i].size, 'f', 1));
+        p.drawText(2 * col_w, y, col_w - 4, ROW_HEIGHT, Qt::AlignRight | Qt::AlignVCenter,
+                   QString::number(cum, 'f', 1));
+
+        p.setPen(QColor(colors::BORDER_DIM()));
+        p.drawLine(0, y + ROW_HEIGHT - 1, w, y + ROW_HEIGHT - 1);
+        y += ROW_HEIGHT;
+    }
+
+    if (bids_.isEmpty() && asks_.isEmpty()) {
+        p.setPen(QColor(colors::TEXT_DIM()));
+        p.drawText(rect(), Qt::AlignCenter, tr("No order book data"));
+    }
+}
+
+void PolymarketOrderBook::changeEvent(QEvent* event) {
+    if (event->type() == QEvent::LanguageChange) {
+        // Painted text reads tr() at paint time; invalidate the cached pixmap
+        // so the next repaint re-evaluates the new language.
+        cache_dirty_ = true;
+        update();
+    }
+    QWidget::changeEvent(event);
+}
+
+} // namespace fincept::screens::polymarket

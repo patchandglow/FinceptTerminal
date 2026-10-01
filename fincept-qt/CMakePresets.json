@@ -1,0 +1,72 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 27, "patch": 0 },
+
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+
+    {
+      "name": "win-dev",
+      "displayName": "Windows Dev (fast incremental)",
+      "description": "Dev build — unity OFF + /DEBUG:FASTLINK incremental linking + PCH + RAM-capped Ninja compile pool + windeployqt-once-per-configure. ~5-6s per one-line change WHEN >5GB RAM is free; the 1000+ object link is RAM-bound and balloons to minutes (even hangs the OS at 12-wide) on a memory-starved machine. Override the pool with -DFINCEPT_MAX_COMPILE_JOBS=N. FINCEPT_DEV_BUILD drives the dev-only tweaks in CMakeLists.txt.",
+      "inherits": "base",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" },
+      "architecture": { "value": "x64", "strategy": "external" },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_UNITY_BUILD": "OFF",
+        "FINCEPT_DEV_BUILD": "ON"
+      }
+    },
+
+    {
+      "name": "win-release",
+      "displayName": "Windows Release",
+      "description": "Release build for Windows x64. Run from a Visual Studio Developer Command Prompt (or vcvars64.bat) so MSVC, SDK headers, and Ninja are on PATH. Set QT_DIR env var or CMAKE_PREFIX_PATH to your Qt installation.",
+      "inherits": "base",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" },
+      "architecture": { "value": "x64", "strategy": "external" },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+
+    {
+      "name": "linux-release",
+      "displayName": "Linux Release",
+      "description": "Release build for Linux x86_64. Set QT_DIR env var or CMAKE_PREFIX_PATH to your Qt installation if not using system packages.",
+      "inherits": "base",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+
+    {
+      "name": "macos-release",
+      "displayName": "macOS Release",
+      "description": "Release build for macOS. Set QT_DIR env var or CMAKE_PREFIX_PATH to your Qt installation.",
+      "inherits": "base",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Darwin" },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_OSX_DEPLOYMENT_TARGET": "13.0"
+      }
+    }
+  ],
+
+  "buildPresets": [
+    { "name": "win-dev",       "configurePreset": "win-dev"       },
+    { "name": "win-release",   "configurePreset": "win-release"   },
+    { "name": "linux-release", "configurePreset": "linux-release" },
+    { "name": "macos-release", "configurePreset": "macos-release" }
+  ]
+}

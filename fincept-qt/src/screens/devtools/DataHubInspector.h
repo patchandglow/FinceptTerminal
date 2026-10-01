@@ -1,0 +1,35 @@
+#pragma once
+
+#include <QEvent>
+#include <QTimer>
+#include <QWidget>
+
+class QLineEdit;
+class QTableWidget;
+
+namespace fincept::screens::devtools {
+
+/// Minimal live view over `DataHub::stats()`. Refreshes once per second
+/// while visible. Surfaced in Settings → Developer as an inline diagnostic
+/// panel (topics, subscriber counts, policy, last publish time).
+class DataHubInspector : public QWidget {
+    Q_OBJECT
+  public:
+    explicit DataHubInspector(QWidget* parent = nullptr);
+
+  protected:
+    void showEvent(QShowEvent* e) override;
+    void hideEvent(QHideEvent* e) override;
+    void changeEvent(QEvent* event) override;
+
+  private:
+    void refresh();
+    void retranslateUi();
+
+    QLineEdit* filter_edit_ = nullptr; // substring filter over the topic column
+    QTableWidget* table_ = nullptr;
+    QTimer refresh_timer_;
+    bool initial_sized_ = false;
+};
+
+} // namespace fincept::screens::devtools

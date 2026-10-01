@@ -1,0 +1,46 @@
+#pragma once
+
+#include <QGraphicsView>
+#include <QRectF>
+#include <QTimer>
+
+namespace fincept::workflow {
+
+class NodeScene;
+
+/// Corner mini-map showing an overview of the entire node canvas.
+/// Renders the same scene at a reduced scale with a viewport rectangle.
+class MiniMap : public QGraphicsView {
+    Q_OBJECT
+  public:
+    MiniMap(NodeScene* scene, QGraphicsView* main_view, QWidget* parent = nullptr);
+
+    void update_viewport_rect();
+
+    /// Start/stop the viewport tracking timer.
+    void start_tracking() {
+        if (update_timer_)
+            update_timer_->start();
+    }
+    void stop_tracking() {
+        if (update_timer_)
+            update_timer_->stop();
+    }
+
+  protected:
+    void paintEvent(QPaintEvent* event) override;
+    void mousePressEvent(QMouseEvent* event) override;
+    void mouseMoveEvent(QMouseEvent* event) override;
+    void resizeEvent(QResizeEvent* event) override;
+
+  private:
+    void center_main_view_on(const QPoint& mini_pos);
+
+    QGraphicsView* main_view_ = nullptr;
+    QTimer* update_timer_ = nullptr;
+    /// Extent the minimap is currently fitted to — re-fitting is skipped while
+    /// the graph's bounding rect is unchanged (see update_viewport_rect()).
+    QRectF fitted_rect_;
+};
+
+} // namespace fincept::workflow

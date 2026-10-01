@@ -1,0 +1,197 @@
+# .gitignore — Fincept Terminal (Qt6 / C++20)
+# ============================================================
+
+# ── CMake user presets (local paths — never commit) ─────────
+CMakeUserPresets.json
+fincept-qt/CMakeUserPresets.json
+
+# ── CMake build output ───────────────────────────────────────
+fincept-qt/build/
+fincept-qt/build-*/
+fincept-qt/build_*/
+fincept-qt/tmpqt/
+# clangd (.clangd → CompilationDatabase: .) expects compile_commands.json at the
+# fincept-qt root; it's a local symlink into the active build dir (a build artifact).
+fincept-qt/compile_commands.json
+tmpqt/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+_deps/
+
+# ── Compiled binaries & libraries ───────────────────────────
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+*.lib
+*.pdb
+*.ilk
+*.exp
+*.pyd
+
+# ── Qt generated files ───────────────────────────────────────
+*.moc
+moc_*.cpp
+moc_*.h
+qrc_*.cpp
+ui_*.h
+*.qm
+
+# ── Python artifacts ─────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+.pdm-python
+.pdm-build
+
+# ── setup.sh runtime directories ─────────────────────────────
+.qt/
+.aqt-venv/
+
+# ── IDE and editor ───────────────────────────────────────────
+.idea/
+.vscode/
+*.suo
+*.user
+*.sln.docstates
+*.ntvs*
+*.njsproj
+*.sw?
+.DS_Store
+Thumbs.db
+agents.md
+
+# ── Logs ─────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Database files (runtime, not source) ─────────────────────
+*.db
+*.db-shm
+*.db-wal
+
+# ── Environment & secrets — NEVER commit ─────────────────────
+.env
+.env.local
+.env.*.local
+*.key
+*.pub
+# NOTE: *.pub is repo-wide and matches PUBLIC keys too. If the auto-updater
+# ever ships its Ed25519 verification key as a file (rather than embedded in
+# C++), it will be invisible to `git add` and absent from a fresh clone —
+# add a `!` negation for that exact path at that time.
+
+# ── Large data / ML model files ──────────────────────────────
+# SCOPED to the Python analytics tree, which is where scripts write their
+# outputs. These globs used to be repo-wide with no negations, which silently
+# dropped any committed fixture: a .csv test input a script needs, a small
+# .bin resource — invisible to `git add`, absent from a fresh clone and from
+# CI, and impossible to notice until something fails at runtime. Build trees
+# (fincept-qt/build*/) are already ignored above, so nothing generated there
+# needs a second rule.
+fincept-qt/scripts/**/*.csv
+fincept-qt/scripts/**/*.bin
+fincept-qt/scripts/**/*.pt
+fincept-qt/scripts/**/*.onnx
+fincept-qt/scripts/**/*.h5
+fincept-qt/scripts/**/*.pkl
+fincept-qt/scripts/**/*.pickle
+fincept-qt/scripts/**/*.model
+fincept-qt/scripts/**/*.weights
+
+# ── Archives ─────────────────────────────────────────────────
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.rar
+*.7z
+
+# ── Legacy / non-C++ build artifacts (defensive ignores) ─────
+fincept-terminal-desktop/
+fincept-cpp/
+**/target/
+*.rlib
+*.rmeta
+node_modules/
+dist-ssr/
+
+# ── Claude Code — never commit ───────────────────────────────
+.claude/
+CLAUDE.md
+fincept-qt/DESIGN_SYSTEM.md
+
+# ── Build output (uitest) ─────────────────────────────────────
+fincept-qt/uitest/build/
+
+# ── ML training artifacts ─────────────────────────────────────
+lightning_logs/
+*.ckpt
+# `*.yaml` was here and is DELETED: it was repo-wide with no negations, so a
+# workflow added as .github/workflows/foo.yaml, a flatpak/AppImage manifest,
+# or any other YAML config would be silently untrackable — invisible to
+# `git add` and simply missing from a fresh clone and from CI. Nothing in the
+# repo was ever tracked as .yaml (verified), and the only .yaml on disk is
+# CMakeConfigureLog.yaml inside an already-ignored build tree.
+
+# ── Shell tree output files ───────────────────────────────────
+**/tree
+
+# ── Duplicate nested agents folder ───────────────────────────
+fincept-qt/scripts/agents/agents/
+
+# ── Firecrawl research artifacts ─────────────────────────────
+.firecrawl/
+
+# ── Clangd cache ─────────────────────────────────────────────
+.cache/
+fincept-qt/.cache/
+
+# ── Exchange runtime cache ────────────────────────────────────
+fincept-qt/scripts/exchange/.cache/
+
+# ── Python test + bench caches ────────────────────────────────
+.pytest_cache/
+.benchmarks/
+
+# ── Editor/refactor backups ───────────────────────────────────
+*.bak
+*.orig
+*.deleted
+*.deleted.*
+
+# ── Local SQLite databases ────────────────────────────────────
+# (*.db is already covered above; adding sqlite variants)
+*.sqlite
+*.sqlite3
+
+# ── Internal planning docs ────────────────────────────────────
+fincept-qt/docs/superpowers/
+docs/superpowers/
+
+# ── Grill-me session notes ────────────────────────────────────
+.grill-me/
+**/.grill-me/
+
+# ── Local planning docs ───────────────────────────────────────
+plans/
+**/plans/
+
+# ── Internal Crypto Center phase notes ────────────────────────
+fincept-qt/docs/CRYPTO_CENTER_PHASE_2.md
+fincept-qt/docs/CRYPTO_CENTER_PHASE_3.md
+fincept-qt/docs/CRYPTO_CENTER_PHASE_4.md
+fincept-qt/docs/CRYPTO_CENTER_PHASE_5.md
+fincept-qt/docs/CRYPTO_WALLET_CONNECT.md
+
+# ── Markdown files — only README.md is tracked ────────────────
+*.md
+!README.md
+!**/README.md

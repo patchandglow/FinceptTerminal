@@ -1,0 +1,367 @@
+#include "trading/websocket/ZerodhaWebSocket.h"
+
+#include "core/logging/Logger.h"
+#include "trading/instruments/InstrumentService.h"
+
+#include <QDateTime>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QString>
+#include <QTimeZone>
+
+namespace fincept::trading {
+
+// ────────────────────────────────────────────────────────────────────────────
+// Big-endian read helpers
+// ────────────────────────────────────────────────────────────────────────────
+
+quint32 ZerodhaWebSocket::read_u32(const uchar* p) {
+    return (quint32(p[0]) << 24) | (quint32(p[1]) << 16) | (quint32(p[2]) << 8) | quint32(p[3]);
+}
+
+qint32 ZerodhaWebSocket::read_i32(const uchar* p) {
+    return qint32(read_u32(p));
+}
+
+quint16 ZerodhaWebSocket::read_u16(const uchar* p) {
+    return quint16((quint16(p[0]) << 8) | quint16(p[1]));
+}
+
+double ZerodhaWebSocket::price_from_wire(qint32 raw, quint32 instrument_token) {
+    // Divisor per pykiteconnect ticker.py: segment = token & 0xFF;
+    // CDS (3) prices are scaled 1e7, BCD (6) 1e4, all others are paise.
+    const quint32 segment = instrument_token & 0xFF;
+    double divisor = 100.0;
+    if (segment == 3) // CDS currency derivatives
+        divisor = 10000000.0;
+    else if (segment == 6) // BCD (BSE currency derivatives)
+        divisor = 10000.0;
+    return raw / divisor;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Constructor / destructor
+// ────────────────────────────────────────────────────────────────────────────
+
+ZerodhaWebSocket::ZerodhaWebSocket(const QString& api_key, const QString& access_token, QObject* parent)
+    : QObject(parent), api_key_(api_key), access_token_(access_token) {
+    ws_ = new WebSocketClient(this);
+    connect(ws_, &WebSocketClient::connected, this, &ZerodhaWebSocket::on_connected);
+    connect(ws_, &WebSocketClient::disconnected, this, &ZerodhaWebSocket::on_disconnected);
+    connect(ws_, &WebSocketClient::binary_message_received, this, &ZerodhaWebSocket::on_binary_message);
+    connect(ws_, &WebSocketClient::error_occurred, this, &ZerodhaWebSocket::error_occurred);
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Public API
+// ────────────────────────────────────────────────────────────────────────────
+
+void ZerodhaWebSocket::open() {
+    QString url = QString("%1?api_key=%2&access_token=%3").arg(kWsUrl, api_key_, access_token_);
+    LOG_INFO("ZerodhaWS", "Connecting to KiteTicker");
+    ws_->connect_to(url);
+}
+
+void ZerodhaWebSocket::close() {
+    ws_->disconnect();
+}
+
+bool ZerodhaWebSocket::is_connected() const {
+    return ws_->is_connected();
+}
+
+void ZerodhaWebSocket::subscribe(const QVector<quint32>& tokens) {
+    QVector<quint32> new_tokens;
+    for (quint32 t : tokens) {
+        if (!subscribed_tokens_.contains(t)) {
+            subscribed_tokens_.insert(t);
+            new_tokens.append(t);
+        }
+    }
+    if (!new_tokens.isEmpty() && is_connected()) {
+        send_subscribe(new_tokens);
+        send_mode(new_tokens);
+    }
+}
+
+void ZerodhaWebSocket::unsubscribe(const QVector<quint32>& tokens) {
+    QVector<quint32> to_remove;
+    for (quint32 t : tokens) {
+        if (subscribed_tokens_.remove(t))
+            to_remove.append(t);
+    }
+    if (!to_remove.isEmpty() && is_connected())
+        send_unsubscribe(to_remove);
+}
+
+void ZerodhaWebSocket::set_subscriptions(const QVector<quint32>& tokens) {
+    subscribed_tokens_.clear();
+    for (quint32 t : tokens)
+        subscribed_tokens_.insert(t);
+    if (is_connected())
+        resubscribe_all();
+}
+
+void ZerodhaWebSocket::clear_subscriptions() {
+    if (is_connected() && !subscribed_tokens_.isEmpty()) {
+        QVector<quint32> all(subscribed_tokens_.begin(), subscribed_tokens_.end());
+        send_unsubscribe(all);
+    }
+    subscribed_tokens_.clear();
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Slots
+// ────────────────────────────────────────────────────────────────────────────
+
+void ZerodhaWebSocket::on_connected() {
+    LOG_INFO("ZerodhaWS", "Connected — resubscribing all tokens");
+    resubscribe_all();
+    emit connected();
+}
+
+void ZerodhaWebSocket::on_disconnected() {
+    LOG_WARN("ZerodhaWS", "Disconnected");
+    emit disconnected();
+}
+
+void ZerodhaWebSocket::on_binary_message(const QByteArray& data) {
+    const uchar* buf = reinterpret_cast<const uchar*>(data.constData());
+    int total = data.size();
+
+    if (total < 2)
+        return;
+
+    int packet_count = int(read_u16(buf));
+    int offset = 2;
+
+    for (int i = 0; i < packet_count && offset + 2 <= total; ++i) {
+        int pkt_len = int(read_u16(buf + offset));
+        offset += 2;
+
+        if (offset + pkt_len > total)
+            break;
+
+        const uchar* pkt = buf + offset;
+        ZerodhaTick tick;
+
+        if (pkt_len == 8) {
+            tick = parse_ltp_packet(pkt);
+        } else if (pkt_len == 44) {
+            tick = parse_quote_packet(pkt);
+        } else if (pkt_len == 184) {
+            tick = parse_full_packet(pkt);
+        } else if (pkt_len == 28 || pkt_len == 32) {
+            // Index quote/full. These used to hit the "unknown size" branch and be
+            // dropped, so an index token (NIFTY 50, BANKNIFTY, …) never produced a tick.
+            tick = parse_index_packet(pkt, pkt_len);
+        } else {
+            // Unknown packet size — skip
+            offset += pkt_len;
+            continue;
+        }
+
+        // Enrich tick with symbol/exchange via InstrumentService
+        auto& svc = InstrumentService::instance();
+        auto inst = svc.find_by_token(tick.instrument_token, "zerodha");
+        if (inst.has_value()) {
+            tick.symbol = inst->symbol;
+            tick.exchange = inst->exchange;
+            tick.tradable = (inst->instrument_type != InstrumentType::INDEX);
+        }
+
+        emit tick_received(tick);
+        offset += pkt_len;
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Send helpers
+// ────────────────────────────────────────────────────────────────────────────
+
+void ZerodhaWebSocket::send_subscribe(const QVector<quint32>& tokens) {
+    // Send in batches of kBatchSize
+    for (int start = 0; start < tokens.size(); start += kBatchSize) {
+        QJsonArray arr;
+        for (int j = start; j < std::min(start + kBatchSize, int(tokens.size())); ++j)
+            arr.append(qint64(tokens[j]));
+        QJsonObject msg;
+        msg["a"] = "subscribe";
+        msg["v"] = arr;
+        ws_->send(QJsonDocument(msg).toJson(QJsonDocument::Compact));
+    }
+}
+
+void ZerodhaWebSocket::send_unsubscribe(const QVector<quint32>& tokens) {
+    for (int start = 0; start < tokens.size(); start += kBatchSize) {
+        QJsonArray arr;
+        for (int j = start; j < std::min(start + kBatchSize, int(tokens.size())); ++j)
+            arr.append(qint64(tokens[j]));
+        QJsonObject msg;
+        msg["a"] = "unsubscribe";
+        msg["v"] = arr;
+        ws_->send(QJsonDocument(msg).toJson(QJsonDocument::Compact));
+    }
+}
+
+void ZerodhaWebSocket::send_mode(const QVector<quint32>& tokens) {
+    // Per-token mode: the one full_mode_token_ (selected symbol) streams "full"
+    // (184-byte, 5-level market depth) so the order book / depth table has data;
+    // every other token streams "quote" (44-byte LTP+OHLC+volume). "full" packets
+    // are 4x heavier to parse on the GUI thread per tick, so keeping the bulk on
+    // "quote" preserves snappy live LTP updates while still feeding depth.
+    QVector<quint32> full_toks, quote_toks;
+    for (quint32 t : tokens) {
+        if (full_mode_token_ != 0 && t == full_mode_token_)
+            full_toks.append(t);
+        else
+            quote_toks.append(t);
+    }
+    send_mode_batch("quote", quote_toks);
+    send_mode_batch("full", full_toks);
+}
+
+void ZerodhaWebSocket::send_mode_batch(const char* mode, const QVector<quint32>& tokens) {
+    for (int start = 0; start < tokens.size(); start += kBatchSize) {
+        QJsonArray arr;
+        for (int j = start; j < std::min(start + kBatchSize, int(tokens.size())); ++j)
+            arr.append(qint64(tokens[j]));
+        QJsonObject msg;
+        msg["a"] = "mode";
+        QJsonArray v;
+        v.append(QString::fromLatin1(mode));
+        v.append(arr);
+        msg["v"] = v;
+        ws_->send(QJsonDocument(msg).toJson(QJsonDocument::Compact));
+    }
+}
+
+void ZerodhaWebSocket::set_full_mode_token(quint32 token) {
+    if (token == full_mode_token_)
+        return;
+    const quint32 old = full_mode_token_;
+    full_mode_token_ = token;
+    if (!is_connected())
+        return; // mode is applied on the next (re)subscribe
+    // Re-send mode for just the affected tokens: the previous full token drops back
+    // to "quote", the new one moves to "full". send_mode() partitions by the
+    // (now updated) full_mode_token_.
+    QVector<quint32> changed;
+    if (old != 0 && subscribed_tokens_.contains(old))
+        changed.append(old);
+    if (token != 0 && subscribed_tokens_.contains(token))
+        changed.append(token);
+    if (!changed.isEmpty())
+        send_mode(changed);
+}
+
+void ZerodhaWebSocket::resubscribe_all() {
+    if (subscribed_tokens_.isEmpty())
+        return;
+    QVector<quint32> all(subscribed_tokens_.begin(), subscribed_tokens_.end());
+    send_subscribe(all);
+    send_mode(all);
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Binary packet parsers
+// ────────────────────────────────────────────────────────────────────────────
+
+ZerodhaTick ZerodhaWebSocket::parse_ltp_packet(const uchar* p) const {
+    ZerodhaTick t;
+    t.instrument_token = read_u32(p);                             // bytes 0-3
+    t.ltp = price_from_wire(read_i32(p + 4), t.instrument_token); // bytes 4-7
+    return t;
+}
+
+ZerodhaTick ZerodhaWebSocket::parse_quote_packet(const uchar* p) const {
+    // 44-byte packet layout (all int32 BE, prices in paise):
+    // 0-3   instrument_token
+    // 4-7   last_price
+    // 8-11  last_quantity (ltq)
+    // 12-15 average_price (atp)
+    // 16-19 volume
+    // 20-23 buy_quantity
+    // 24-27 sell_quantity
+    // 28-31 open
+    // 32-35 high
+    // 36-39 low
+    // 40-43 close
+    ZerodhaTick t;
+    t.instrument_token = read_u32(p);
+    t.ltp = price_from_wire(read_i32(p + 4), t.instrument_token);
+    t.last_quantity = read_i32(p + 8);
+    t.average_price = price_from_wire(read_i32(p + 12), t.instrument_token);
+    t.volume = read_i32(p + 16);
+    t.buy_quantity = read_i32(p + 20);
+    t.sell_quantity = read_i32(p + 24);
+    t.open = price_from_wire(read_i32(p + 28), t.instrument_token);
+    t.high = price_from_wire(read_i32(p + 32), t.instrument_token);
+    t.low = price_from_wire(read_i32(p + 36), t.instrument_token);
+    t.close = price_from_wire(read_i32(p + 40), t.instrument_token);
+    return t;
+}
+
+ZerodhaTick ZerodhaWebSocket::parse_index_packet(const uchar* p, int len) const {
+    // Index packet layout (all int32 BE, prices in paise) — per KiteTicker:
+    // 0-3   instrument_token
+    // 4-7   last_price
+    // 8-11  high          (NB: H, L, O, C — not the O, H, L, C order of stock quotes)
+    // 12-15 low
+    // 16-19 open
+    // 20-23 close
+    // 24-27 price change (derived by consumers from ltp/close; not stored)
+    // 28-31 exchange_timestamp (unix epoch seconds) — 32-byte "full" packets only
+    ZerodhaTick t;
+    t.instrument_token = read_u32(p);
+    t.tradable = false;
+    t.ltp = price_from_wire(read_i32(p + 4), t.instrument_token);
+    t.high = price_from_wire(read_i32(p + 8), t.instrument_token);
+    t.low = price_from_wire(read_i32(p + 12), t.instrument_token);
+    t.open = price_from_wire(read_i32(p + 16), t.instrument_token);
+    t.close = price_from_wire(read_i32(p + 20), t.instrument_token);
+    if (len >= 32)
+        t.exchange_timestamp = QDateTime::fromSecsSinceEpoch(read_i32(p + 28), QTimeZone::UTC);
+    return t;
+}
+
+ZerodhaTick ZerodhaWebSocket::parse_full_packet(const uchar* p) const {
+    // 184-byte full packet:
+    // 0-43  same as quote packet (44 bytes)
+    // 44-47 last_trade_time (unix epoch, seconds)
+    // 48-51 oi
+    // 52-55 oi_day_high
+    // 56-59 oi_day_low
+    // 60-63 exchange_timestamp (unix epoch, seconds)
+    // 64-183 market depth: 10 levels × 12 bytes each
+    //   Each level: quantity(4) + price(4) + orders(2) + padding(2)
+    //   First 5 = bids, next 5 = asks
+    ZerodhaTick t = parse_quote_packet(p); // first 44 bytes identical
+
+    // last_trade_time at offset 44 — not stored, just skip
+    t.oi = read_i32(p + 48);
+    t.oi_day_high = read_i32(p + 52);
+    t.oi_day_low = read_i32(p + 56);
+
+    qint32 ex_ts = read_i32(p + 60);
+    t.exchange_timestamp = QDateTime::fromSecsSinceEpoch(ex_ts, QTimeZone::UTC);
+
+    // Depth: 5 bids then 5 asks, each 12 bytes
+    for (int i = 0; i < 5; ++i) {
+        int base = 64 + i * 12;
+        t.bids[i].quantity = read_i32(p + base);
+        t.bids[i].price = price_from_wire(read_i32(p + base + 4), t.instrument_token);
+        t.bids[i].orders = int(read_u16(p + base + 8));
+    }
+    for (int i = 0; i < 5; ++i) {
+        int base = 64 + (5 + i) * 12;
+        t.asks[i].quantity = read_i32(p + base);
+        t.asks[i].price = price_from_wire(read_i32(p + base + 4), t.instrument_token);
+        t.asks[i].orders = int(read_u16(p + base + 8));
+    }
+
+    return t;
+}
+
+} // namespace fincept::trading

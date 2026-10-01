@@ -1,0 +1,111 @@
+#pragma once
+#include "screens/news/NewsFeedDelegate.h"
+#include "screens/news/NewsFeedModel.h"
+#include "services/news/NewsClusterService.h"
+#include "services/news/NewsService.h"
+
+#include <QEvent>
+#include <QLabel>
+#include <QListView>
+#include <QStackedWidget>
+#include <QTimer>
+#include <QVBoxLayout>
+#include <QWidget>
+
+namespace fincept::screens {
+
+class NewsFeedPanel : public QWidget {
+    Q_OBJECT
+  public:
+    explicit NewsFeedPanel(QWidget* parent = nullptr);
+
+    NewsFeedModel* model() { return model_; }
+    QListView* list_view() { return list_view_; }
+
+    void show_breaking(const QVector<services::NewsCluster>& breaking_clusters);
+    void clear_breaking();
+    void set_loading(bool loading);
+    /// When loading has finished but no articles arrived, show a non-blocking
+    /// empty-state message ("No articles available — check connection").
+    /// Calling with `false` (or any successful set_wire_articles) hides it.
+    void set_empty_state(bool empty);
+    void scroll_to(const QString& article_id);
+    void set_selected(const QString& article_id);
+    void select_next();
+    void select_previous();
+
+  signals:
+    void article_clicked(const services::NewsArticle& article);
+    void cluster_clicked(const services::NewsCluster& cluster);
+    void near_bottom();
+    /// Context-menu "filter feed by $TICKER" — the screen routes it through the
+    /// same path as a typed search.
+    void ticker_filter_requested(const QString& ticker);
+
+  protected:
+    void changeEvent(QEvent* event) override;
+
+  private slots:
+    void on_item_clicked(const QModelIndex& index);
+    void check_scroll_position();
+    void show_context_menu(const QPoint& pos);
+
+  private:
+    void build_breaking_banner();
+    void build_skeleton();
+    void remove_skeleton();
+    bool is_banner_duplicate(const QString& headline) const;
+
+    /// Capture / restore the reading position across a model reset. A feed
+    /// refresh (auto-refresh, live WS article, filter re-apply) resets the
+    /// model, which drops the QListView back to row 0 — scrolling a user away
+    /// from the item they were reading. We anchor on the article that was at
+    /// the top of the viewport and re-scroll to it once the reset completes.
+    void capture_scroll_anchor();
+    void restore_scroll_anchor();
+
+    /// Re-apply tr() lookups to every widget whose text we keep a handle to.
+    /// Called from changeEvent() on QEvent::LanguageChange.
+    void retranslateUi();
+
+    QStackedWidget* stack_ = nullptr;
+    QListView* list_view_ = nullptr;
+    NewsFeedModel* model_ = nullptr;
+    NewsFeedDelegate* delegate_ = nullptr;
+
+    // Breaking banner
+    QWidget* banner_widget_ = nullptr;
+    QLabel* banner_tag_ = nullptr;
+    QLabel* banner_headline_ = nullptr;
+    QLabel* banner_source_ = nullptr;
+    QTimer* banner_dismiss_timer_ = nullptr;
+
+    struct BreakingEntry {
+        QString headline_key;
+        int64_t shown_at = 0;
+    };
+    QVector<BreakingEntry> recent_banners_;
+    int64_t global_cooldown_until_ = 0;
+    static constexpr int BANNER_DEDUP_WINDOW_SEC = 1800;   // 30 min
+    static constexpr int BANNER_GLOBAL_COOLDOWN_SEC = 120; // 2 min
+    static constexpr int SOUND_COOLDOWN_SEC = 300;         // 5 min
+    int64_t last_sound_at_ = 0;
+
+    // Skeleton loading
+    QWidget* skeleton_overlay_ = nullptr;
+    QTimer* skeleton_anim_timer_ = nullptr;
+    int skeleton_phase_ = 0;
+    bool is_loading_ = false;
+
+    // Empty-state widget (shown when loading is done + no articles)
+    QWidget* empty_state_ = nullptr;
+    QLabel* empty_state_title_ = nullptr;
+    QLabel* empty_state_hint_ = nullptr;
+
+    // Scroll/selection preservation across model resets.
+    QString anchor_article_id_;  // article at the top of the viewport
+    QString current_article_id_; // article under the keyboard cursor
+    bool anchor_was_at_top_ = true;
+};
+
+} // namespace fincept::screens

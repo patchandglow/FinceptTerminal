@@ -1,0 +1,114 @@
+#pragma once
+// FnoScreen — Sensibull-style F&O analytics tab.
+//
+// Top-level shell. Seven sub-tabs hosted in a QStackedWidget; each sub-tab
+// is lazy-constructed on first reveal (P2 spirit — chain assembly + WS
+// subscriptions for the OI sub-tab don't fire until the user navigates
+// there). Only Chain is built eagerly, so the screen shows data immediately.
+//
+// All seven are implemented: Chain, Builder, OI Analytics, Multi-Straddle,
+// FII/DII, Screener, Positions. The QStackedWidget is seeded with placeholder
+// widgets purely so slot indices map 1:1 onto SubTab values; each is swapped
+// for the real widget before it can ever be shown.
+
+#include "core/symbol/IGroupLinked.h"
+#include "screens/common/IStatefulScreen.h"
+
+#include <QEvent>
+#include <QHash>
+#include <QPointer>
+#include <QPushButton>
+#include <QStackedWidget>
+#include <QString>
+#include <QVariantMap>
+#include <QWidget>
+
+#include <functional>
+
+namespace fincept::screens::common {
+class PaperBlotterPanel;
+}
+
+namespace fincept::screens::fno {
+
+class BuilderSubTab;
+class ChainSubTab;
+
+class FnoScreen : public QWidget, public fincept::screens::IStatefulScreen, public fincept::IGroupLinked {
+    Q_OBJECT
+    Q_INTERFACES(fincept::IGroupLinked)
+  public:
+    explicit FnoScreen(QWidget* parent = nullptr);
+
+    // ── IStatefulScreen ────────────────────────────────────────────────────
+    QVariantMap save_state() const override;
+    void restore_state(const QVariantMap& state) override;
+    QString state_key() const override { return "fno"; }
+    int state_version() const override { return 1; }
+
+    // ── IGroupLinked — symbol-group sync ───────────────────────────────────
+    void set_group(fincept::SymbolGroup g) override { link_group_ = g; }
+    fincept::SymbolGroup group() const override { return link_group_; }
+    void on_group_symbol_changed(const fincept::SymbolRef& ref) override;
+    fincept::SymbolRef current_symbol() const override;
+
+  protected:
+    void showEvent(QShowEvent* e) override;
+    void hideEvent(QHideEvent* e) override;
+    void changeEvent(QEvent* event) override;
+
+  public:
+    enum SubTab : int {
+        TabChain = 0,
+        TabBuilder = 1,
+        TabOI = 2,
+        TabMultiStraddle = 3,
+        TabFiiDii = 4,
+        TabScreener = 5,
+        TabPositions = 6,
+        TabCount
+    };
+
+  private slots:
+    void on_tab_clicked(int index);
+
+  private:
+    void setup_ui();
+    QWidget* build_tab_bar();
+    QWidget* build_placeholder(const QString& tab_name, const QString& detail);
+
+    /// Re-apply tr() lookups to the tab-bar buttons on QEvent::LanguageChange.
+    void retranslateUi();
+
+    /// Translated tab label / detail for the given slot index.
+    static QString tab_label_for(int index);
+    static QString tab_detail_for(int index);
+
+    /// Lazy-construct the requested sub-tab and insert it into the stack at
+    /// its slot index. No-op if already present.
+    void ensure_tab_built(SubTab which);
+
+    /// Apply pressed/normal styling to tab buttons based on `active_tab_`.
+    void refresh_tab_button_styles();
+
+    SubTab active_tab_ = TabChain;
+    QStackedWidget* stack_ = nullptr;
+    QVector<QPushButton*> tab_btns_;
+    QHash<int, QWidget*> tabs_; // slot index → widget
+
+    // Direct pointer to the chain sub-tab so showEvent can poke its
+    // visibility-driven subscription path.
+    QPointer<ChainSubTab> chain_tab_;
+    QPointer<BuilderSubTab> builder_tab_;
+    QPointer<class OISubTab> oi_tab_;
+    QPointer<class FiiDiiSubTab> fii_dii_tab_;
+    QPointer<class MultiStraddleSubTab> multi_straddle_tab_;
+    QPointer<class ScreenerSubTab> screener_tab_;
+    QPointer<fincept::screens::common::PaperBlotterPanel> positions_tab_;
+
+    // Group G is the "yellow" slot in the default palette (per SymbolGroup.h
+    // line 16). Plan called for Yellow as the F&O default — that's slot G.
+    fincept::SymbolGroup link_group_ = fincept::SymbolGroup::G;
+};
+
+} // namespace fincept::screens::fno
